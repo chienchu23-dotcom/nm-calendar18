@@ -1,0 +1,1402 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <!-- Viewport 設定：允許縮放，設定最小與最大縮放比例 -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=1.0, maximum-scale=5.0, user-scalable=yes">
+    <title>核醫請假行事曆 (Nuclear Medicine Leave Calendar)</title>
+    
+    <!-- 1. Core Libraries -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@0.263.1/dist/umd/lucide.min.js"></script>
+
+    <!-- 2. Firebase SDK (Compat Version) -->
+    <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-auth-compat.js"></script>
+
+    <!-- 3. Custom Styles -->
+    <style>
+        body {
+            font-family: 'Noto Sans TC', system-ui, -apple-system, sans-serif;
+            background-color: #f8fafc; /* Slate-50 */
+        }
+        .scrollbar-hide::-webkit-scrollbar { display: none; }
+        .scrollbar-hide { -ms-overflow-style: none; scrollbar-width: none; }
+        
+        .calendar-grid {
+            display: grid;
+            grid-template-columns: repeat(7, minmax(0, 1fr));
+        }
+        
+        /* Animations */
+        .fade-in { animation: fadeIn 0.3s ease-out; }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(5px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        .spin-slow { animation: spin 2s linear infinite; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        
+        /* Pulse animation for selection mode */
+        .pulse-border { animation: pulseBorder 1.5s infinite; }
+        @keyframes pulseBorder {
+            0% { border-color: #f97316; box-shadow: 0 0 0 0 rgba(249, 115, 22, 0.4); }
+            70% { border-color: #f97316; box-shadow: 0 0 0 4px rgba(249, 115, 22, 0); }
+            100% { border-color: #f97316; box-shadow: 0 0 0 0 rgba(249, 115, 22, 0); }
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useMemo, useRef } = React;
+
+        // --- 1. Configuration & Constants ---
+        
+        const DEFAULT_FIREBASE_CONFIG = {
+            apiKey: "AIzaSyCwsASHnWRhdfmEPGd4Eza5WfbsKuYwf9s",
+            authDomain: "nm-calendar-demo.firebaseapp.com",
+            projectId: "nm-calendar-demo",
+            storageBucket: "nm-calendar-demo.firebasestorage.app",
+            messagingSenderId: "804446115398",
+            appId: "1:804446115398:web:e4507f9680024007e5dc47"
+        };
+
+        const CONFIG_STORAGE_KEY = 'nm_calendar_config_v4';
+
+        // 預設管理員密碼
+        const ADMIN_PASSWORD = "admin";
+
+        const GROUPS = {
+            '2F': { label: '2F', color: 'bg-blue-100 text-blue-800 border-blue-200', icon: 'Users' },
+            'PET': { label: '正子', color: 'bg-orange-100 text-orange-800 border-orange-200', icon: 'Activity' },
+            'EVENT': { label: '事項', color: 'bg-purple-100 text-purple-800 border-purple-200', icon: 'Megaphone' }
+        };
+
+        const PERIODS = {
+            'FULL': { label: '全天', value: 'FULL' },
+            'AM': { label: '上午', value: 'AM' },
+            'PM': { label: '下午', value: 'PM' }
+        };
+
+        // 產生時間選單 08:00 ~ 21:00 (間隔30分)
+        const TIME_OPTIONS = [];
+        for(let h=8; h<=21; h++) {
+            const hour = h.toString().padStart(2, '0');
+            TIME_OPTIONS.push(`${hour}:00`);
+            if(h !== 21) TIME_OPTIONS.push(`${hour}:30`);
+        }
+
+        // 人員名單
+        const STAFF_NAMES = [
+            "王", "羅", "董", "仲", "琿", "盧", "敏", "榮", "助", "怡", "欣", "丞", "嫣", "妮"
+        ];
+
+        // --- 2. Utility Functions ---
+        const getDaysInMonth = (year, month) => new Date(year, month + 1, 0).getDate();
+        const getFirstDayOfMonth = (year, month) => new Date(year, month, 1).getDay();
+
+        const formatDateForInput = (date) => {
+            const d = new Date(date);
+            let month = '' + (d.getMonth() + 1);
+            let day = '' + d.getDate();
+            const year = d.getFullYear();
+            if (month.length < 2) month = '0' + month;
+            if (day.length < 2) day = '0' + day;
+            return [year, month, day].join('-');
+        };
+
+        const formatTime = (isoString) => {
+            if (!isoString) return '';
+            const d = new Date(isoString);
+            return `${d.getMonth()+1}/${d.getDate()} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+        };
+
+        const isDateBetween = (target, start, end) => {
+            const targetDate = new Date(target).setHours(0,0,0,0);
+            const startDate = new Date(start).setHours(0,0,0,0);
+            const endDate = new Date(end).setHours(0,0,0,0);
+            return targetDate >= startDate && targetDate <= endDate;
+        };
+
+        // --- 假日判斷函式 ---
+        const getHoliday = (date) => {
+            const y = date.getFullYear();
+            const m = String(date.getMonth() + 1).padStart(2, '0');
+            const d = String(date.getDate()).padStart(2, '0');
+            const ymd = `${y}-${m}-${d}`;
+            const md = `${m}-${d}`;
+
+            // 1. 固定國曆假日
+            const fixed = {
+                '01-01': '元旦',
+                '02-28': '和平紀念日',
+                '04-04': '兒童節',
+                '05-01': '勞動節',
+                '09-28': '教師節',
+                '10-10': '國慶日',
+                '10-25': '光復節',
+                '12-25': '行憲紀念日'
+            };
+            
+            if (fixed[md]) return fixed[md];
+
+            // 2. 變動假日
+            const variable = {
+                '2024-02-09': '除夕', '2024-02-10': '春節', '2024-02-11': '初二', '2024-02-12': '初三', '2024-02-13': '初四',
+                '2024-04-04': '清明節', 
+                '2024-06-10': '端午節',
+                '2024-09-17': '中秋節',
+                '2025-01-28': '除夕', '2025-01-29': '春節', '2025-01-30': '初二', '2025-01-31': '初三', '2025-02-01': '初四',
+                '2025-04-05': '清明節',
+                '2025-05-31': '端午節',
+                '2025-10-06': '中秋節',
+                '2026-02-16': '除夕', '2026-02-17': '春節', '2026-02-18': '初二', '2026-02-19': '初三', '2026-02-20': '初四',
+                '2026-04-05': '清明節', '2026-04-06': '清明節補假',
+                '2026-06-19': '端午節',
+                '2026-09-25': '中秋節'
+            };
+            if (variable[ymd]) return variable[ymd];
+
+            // 3. 補假邏輯
+            const dayOfWeek = date.getDay(); 
+            if (dayOfWeek === 5) {
+                const next = new Date(date);
+                next.setDate(date.getDate() + 1);
+                const nextMd = `${String(next.getMonth() + 1).padStart(2, '0')}-${String(next.getDate()).padStart(2, '0')}`;
+                if (fixed[nextMd]) return `${fixed[nextMd]}(補假)`;
+            }
+            if (dayOfWeek === 1) {
+                const prev = new Date(date);
+                prev.setDate(date.getDate() - 1);
+                const prevMd = `${String(prev.getMonth() + 1).padStart(2, '0')}-${String(prev.getDate()).padStart(2, '0')}`;
+                if (fixed[prevMd]) return `${fixed[prevMd]}(補假)`;
+            }
+
+            return null;
+        };
+
+        // --- 4. Icon Component ---
+        const Icon = ({ name, size = 16, className = "" }) => {
+            const containerRef = useRef(null);
+            
+            useEffect(() => {
+                const container = containerRef.current;
+                if (!container || !window.lucide) return;
+
+                container.innerHTML = '';
+                const iconElement = document.createElement('i');
+                const kebabName = name.replace(/([a-z0-9])([A-Z])/g, '$1-$2').toLowerCase();
+                
+                iconElement.setAttribute('data-lucide', kebabName);
+                iconElement.setAttribute('width', size);
+                iconElement.setAttribute('height', size);
+                if (className) iconElement.setAttribute('class', className);
+
+                container.appendChild(iconElement);
+                
+                window.lucide.createIcons({
+                    root: container,
+                    nameAttr: 'data-lucide',
+                    attrs: { "stroke-width": 2.5 }
+                });
+            }, [name, size, className]);
+
+            return <span ref={containerRef} style={{ display: 'inline-flex', verticalAlign: 'middle' }}></span>;
+        };
+
+        // --- 5. Global Variables ---
+        let dbInstance = null;
+        let currentAppId = 'default-app-id';
+
+        // --- 6. Main Application ---
+        const App = () => {
+            const [currentDate, setCurrentDate] = useState(new Date());
+            const [leaves, setLeaves] = useState([]);
+            
+            const [isModalOpen, setIsModalOpen] = useState(false);
+            const [isConfigOpen, setIsConfigOpen] = useState(false);
+            const [isHistoryOpen, setIsHistoryOpen] = useState(false);
+            const [isReportOpen, setIsReportOpen] = useState(false); 
+            
+            // New state for Daily Summary
+            const [summaryDate, setSummaryDate] = useState(null);
+            
+            const [historyLogs, setHistoryLogs] = useState([]);
+            const [isLoading, setIsLoading] = useState(false);
+            
+            const [notification, setNotification] = useState(null); 
+            const [isDeleteConfirmOpen, setIsDeleteConfirmOpen] = useState(false); 
+            const [deleteTarget, setDeleteTarget] = useState(null); // 'ALL' or 'SINGLE'
+            
+            const [isMultiSelectMode, setIsMultiSelectMode] = useState(false);
+            const [selectedDates, setSelectedDates] = useState(new Set());
+
+            const [syncStatus, setSyncStatus] = useState('initializing');
+            const [errorMsg, setErrorMsg] = useState('');
+            const [configInput, setConfigInput] = useState('');
+
+            const [formData, setFormData] = useState({
+                id: null, 
+                name: '', 
+                type: '2F', 
+                startDate: '', 
+                endDate: '', 
+                note: '', 
+                period: 'FULL', 
+                startTime: '', 
+                endTime: '',
+                clickedDate: null // To track which day was clicked to open edit
+            });
+
+            // Report States
+            const [reportYear, setReportYear] = useState(Math.max(2026, new Date().getFullYear()));
+            const [reportMonth, setReportMonth] = useState(new Date().getMonth());
+            const [reportViewType, setReportViewType] = useState('year'); // 'year' or 'month'
+
+            const yearOptions = useMemo(() => {
+                const startYear = 2026;
+                const currentYear = new Date().getFullYear();
+                const endYear = Math.max(startYear + 5, currentYear + 5);
+                
+                const options = [];
+                for(let i = startYear; i <= endYear; i++) {
+                    options.push(i);
+                }
+                return options;
+            }, []);
+
+            const touchStartRef = useRef({ x: 0, y: 0 });
+
+            const checkIsHoliday = (d) => {
+                const day = d.getDay();
+                if (day === 0 || day === 6) return true;
+                if (getHoliday(d)) return true;
+                return false;
+            };
+
+            const showNotification = (type, message) => {
+                setNotification({ type, message });
+                setTimeout(() => setNotification(null), 3000);
+            };
+
+            const handleOpenConfig = () => {
+                const pwd = prompt(`請輸入管理員密碼以進入設定 (預設: ${ADMIN_PASSWORD}):`);
+                if (pwd === ADMIN_PASSWORD) {
+                    setIsConfigOpen(true);
+                } else if (pwd !== null) {
+                    alert("密碼錯誤");
+                }
+            };
+
+            // Get Device Info (Enhanced)
+            const getDeviceInfo = () => {
+                const ua = navigator.userAgent;
+                
+                // Mobile Devices
+                if (/iPhone/i.test(ua)) return 'iPhone';
+                if (/iPad/i.test(ua)) return 'iPad';
+                if (/Android/i.test(ua)) return 'Android';
+                
+                // Desktop OS
+                if (/Win/i.test(ua)) return 'Windows PC';
+                if (/Mac/i.test(ua)) return 'Mac';
+                if (/Linux/i.test(ua)) return 'Linux';
+                
+                // Fallback
+                if (/Mobile/i.test(ua)) return '手機端';
+                return '電腦端';
+            };
+
+            useEffect(() => {
+                const initApp = async () => {
+                    let configToUse = DEFAULT_FIREBASE_CONFIG;
+                    if (typeof __firebase_config !== 'undefined' && __firebase_config) {
+                        try {
+                            configToUse = JSON.parse(__firebase_config);
+                        } catch (e) { console.error("Env config parse error", e); }
+                    } else {
+                        const savedConfig = localStorage.getItem(CONFIG_STORAGE_KEY);
+                        if (savedConfig) {
+                            try {
+                                const parsed = JSON.parse(savedConfig);
+                                if (parsed.apiKey) configToUse = parsed;
+                            } catch (e) { console.error(e); }
+                        }
+                    }
+
+                    if (typeof __app_id !== 'undefined' && __app_id) {
+                        currentAppId = __app_id;
+                    }
+
+                    setConfigInput(JSON.stringify(configToUse, null, 2));
+
+                    if (!configToUse.apiKey) {
+                        setSyncStatus('waiting_config');
+                        return;
+                    }
+
+                    try {
+                        if (!firebase.apps.length) {
+                            firebase.initializeApp(configToUse);
+                        }
+                        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                            await firebase.auth().signInWithCustomToken(__initial_auth_token);
+                        } else {
+                            await firebase.auth().signInAnonymously();
+                        }
+                        dbInstance = firebase.firestore();
+                        startSync();
+                    } catch (e) {
+                        console.error("Firebase Init Error:", e);
+                        setSyncStatus('error');
+                        setErrorMsg(e.message);
+                    }
+                };
+                initApp();
+            }, []);
+
+            const startSync = () => {
+                if (!dbInstance) return;
+                setIsLoading(true);
+                const collectionRef = dbInstance.collection('artifacts').doc(currentAppId).collection('public').doc('data').collection('leaves');
+                const unsubscribe = collectionRef.orderBy('startDate', 'asc').onSnapshot((snapshot) => {
+                    const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    setLeaves(data);
+                    setIsLoading(false);
+                    setSyncStatus('connected');
+                    setErrorMsg('');
+                }, (err) => {
+                    setIsLoading(false);
+                    setSyncStatus('error');
+                    if (err.code === 'permission-denied') {
+                        setErrorMsg('權限不足：請檢查 Firestore Rules');
+                    } else {
+                        setErrorMsg(err.message);
+                    }
+                });
+                return () => unsubscribe();
+            };
+
+            const addHistoryLog = async (action, leaveData) => {
+                if (!dbInstance) return;
+                try {
+                    const historyRef = dbInstance.collection('artifacts').doc(currentAppId).collection('public').doc('data').collection('history');
+                    const groupConf = GROUPS[leaveData.type];
+                    const groupLabel = groupConf ? groupConf.label : (leaveData.type || '未分類');
+                    const periodLabel = leaveData.period && leaveData.period !== 'FULL' ? `(${PERIODS[leaveData.period].label})` : '';
+                    const timeLabel = (leaveData.startTime && leaveData.endTime) ? ` ${leaveData.startTime}-${leaveData.endTime}` : '';
+                    
+                    // Get current device info
+                    const deviceInfo = getDeviceInfo();
+
+                    await historyRef.add({
+                        action,
+                        timestamp: new Date().toISOString(),
+                        details: {
+                            name: leaveData.name || '無名氏',
+                            group: `${groupLabel} ${periodLabel}`,
+                            date: leaveData.startDate === leaveData.endDate ? leaveData.startDate : `${leaveData.startDate} ~ ${leaveData.endDate}`,
+                            note: (leaveData.note || '') + timeLabel,
+                            device: deviceInfo
+                        }
+                    });
+                } catch (e) {
+                    console.error("Failed to log history", e);
+                }
+            };
+
+            useEffect(() => {
+                if (!isHistoryOpen || !dbInstance) return;
+                const historyRef = dbInstance.collection('artifacts').doc(currentAppId).collection('public').doc('data').collection('history');
+                const unsubscribe = historyRef.orderBy('timestamp', 'desc').limit(50).onSnapshot(snapshot => {
+                    const logs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    setHistoryLogs(logs);
+                });
+                return () => unsubscribe();
+            }, [isHistoryOpen]);
+
+            const getCollectionRef = () => {
+                if (!dbInstance) throw new Error("Database not initialized");
+                return dbInstance.collection('artifacts').doc(currentAppId).collection('public').doc('data').collection('leaves');
+            };
+
+            const handleSave = async (e) => {
+                if (e) e.preventDefault();
+                if (syncStatus !== 'connected') { 
+                    showNotification('error', '資料庫未連線'); 
+                    return; 
+                }
+                
+                setIsLoading(true);
+
+                if (formData.type !== 'EVENT') {
+                    const isPet = formData.type === 'PET';
+                    const groupLabel = isPet ? '正子' : '2F';
+                    
+                    let shouldCheck = true;
+
+                    if (formData.id) {
+                        const original = leaves.find(l => l.id === formData.id);
+                        if (original) {
+                            const orgType = original.type;
+                            const newType = formData.type;
+                            const orgPeriod = original.period || 'FULL';
+                            const newPeriod = formData.period || 'FULL';
+                            
+                            if (orgType === newType && 
+                                orgPeriod === newPeriod &&
+                                original.startDate === formData.startDate && 
+                                original.endDate === formData.endDate) {
+                                shouldCheck = false;
+                            }
+                        }
+                    }
+
+                    if (shouldCheck) {
+                        const datesToCheck = [];
+                        if (isMultiSelectMode && selectedDates.size > 0 && !formData.id) {
+                            selectedDates.forEach(d => datesToCheck.push(d));
+                        } else {
+                            let curr = new Date(formData.startDate);
+                            const end = new Date(formData.endDate);
+                            if (curr <= end) {
+                                while (curr <= end) {
+                                    if (formData.type === 'EVENT' || !checkIsHoliday(curr)) {
+                                        datesToCheck.push(formatDateForInput(curr));
+                                    }
+                                    curr.setDate(curr.getDate() + 1);
+                                }
+                            } else {
+                                const single = new Date(formData.startDate);
+                                if (formData.type === 'EVENT' || !checkIsHoliday(single)) {
+                                    datesToCheck.push(formData.startDate);
+                                }
+                            }
+                        }
+
+                        for (const dateStr of datesToCheck) {
+                            const checkDateObj = new Date(dateStr);
+                            const dailyLeaves = leaves.filter(l => {
+                                if (formData.id && l.id === formData.id) return false;
+                                if (l.type !== formData.type) return false;
+                                return isDateBetween(checkDateObj, l.startDate, l.endDate);
+                            });
+
+                            const amUsed = dailyLeaves.filter(l => !l.period || l.period === 'FULL' || l.period === 'AM').length;
+                            const pmUsed = dailyLeaves.filter(l => !l.period || l.period === 'FULL' || l.period === 'PM').length;
+
+                            const reqAM = (formData.period === 'FULL' || formData.period === 'AM');
+                            const reqPM = (formData.period === 'FULL' || formData.period === 'PM');
+
+                            if (isPet) {
+                                if (reqAM && amUsed >= 2) {
+                                    showNotification('error', `${dateStr} 【正子】上午已滿 2 人 (含全天)`);
+                                    setIsLoading(false); return;
+                                }
+                                if (reqPM && pmUsed >= 2) {
+                                    showNotification('error', `${dateStr} 【正子】下午已滿 2 人 (含全天)`);
+                                    setIsLoading(false); return;
+                                }
+                            } else {
+                                if (reqAM && amUsed >= 2) {
+                                    showNotification('error', `${dateStr} 【2F】上午已滿 2 人 (含全天)`);
+                                    setIsLoading(false); return;
+                                }
+                                if (reqPM && pmUsed >= 3) {
+                                    showNotification('error', `${dateStr} 【2F】下午已滿 3 人 (含全天)`);
+                                    setIsLoading(false); return;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                try {
+                    const ref = getCollectionRef();
+                    let datesToProcess = [];
+
+                    if (isMultiSelectMode && selectedDates.size > 0 && !formData.id) {
+                        datesToProcess = Array.from(selectedDates).sort();
+                    } else {
+                        let curr = new Date(formData.startDate);
+                        const end = new Date(formData.endDate);
+                        if (curr <= end) {
+                            while (curr <= end) {
+                                if (formData.type === 'EVENT' || !checkIsHoliday(curr)) {
+                                    datesToProcess.push(formatDateForInput(curr));
+                                }
+                                curr.setDate(curr.getDate() + 1);
+                            }
+                        } else {
+                            datesToProcess.push(formData.startDate);
+                        }
+                    }
+
+                    if (datesToProcess.length === 0) {
+                        showNotification('error', '選取區間內無工作日 (已自動跳過假日)');
+                        setIsLoading(false);
+                        return;
+                    }
+
+                    const ranges = [];
+                    if (datesToProcess.length > 0) {
+                        let start = datesToProcess[0];
+                        let end = datesToProcess[0];
+
+                        for (let i = 1; i < datesToProcess.length; i++) {
+                            const current = datesToProcess[i];
+                            const diff = Date.parse(current) - Date.parse(end);
+                            if (diff === 86400000) {
+                                end = current;
+                            } else {
+                                ranges.push({ startDate: start, endDate: end });
+                                start = current;
+                                end = current;
+                            }
+                        }
+                        ranges.push({ startDate: start, endDate: end });
+                    }
+
+                    if (formData.id) {
+                        const firstRange = ranges[0];
+                        let defaultEndTime = '17:00';
+                        if (formData.period === 'AM') {
+                            defaultEndTime = '12:30';
+                        }
+
+                        const updateData = {
+                            name: formData.name,
+                            type: formData.type,
+                            period: formData.period || 'FULL',
+                            startTime: formData.startTime || '',
+                            endTime: formData.endTime || defaultEndTime,
+                            startDate: firstRange.startDate,
+                            endDate: firstRange.endDate,
+                            note: formData.note
+                        };
+                        
+                        await ref.doc(formData.id).update(updateData);
+                        await addHistoryLog('UPDATE', updateData);
+
+                        for (let i = 1; i < ranges.length; i++) {
+                            const r = ranges[i];
+                            const newData = { ...updateData, startDate: r.startDate, endDate: r.endDate, createdAt: new Date().toISOString() };
+                            await ref.add(newData);
+                            await addHistoryLog('CREATE', newData);
+                        }
+
+                    } else {
+                        const promises = ranges.map(async range => {
+                            let defaultEndTime = '17:00';
+                            if (formData.period === 'AM') {
+                                defaultEndTime = '12:30';
+                            }
+
+                            const leavePayload = {
+                                name: formData.name,
+                                type: formData.type,
+                                period: formData.period || 'FULL',
+                                startTime: formData.startTime || '',
+                                endTime: formData.endTime || defaultEndTime,
+                                startDate: range.startDate,
+                                endDate: range.endDate,
+                                note: formData.note,
+                                createdAt: new Date().toISOString()
+                            };
+                            await addHistoryLog(isMultiSelectMode ? 'BATCH_CREATE' : 'CREATE', leavePayload);
+                            return ref.add(leavePayload);
+                        });
+                        await Promise.all(promises);
+                    }
+
+                    setIsModalOpen(false);
+                    setFormData({ 
+                        id: null, name: '', type: '2F', startDate: '', endDate: '', note: '', 
+                        period: 'FULL', startTime: '', endTime: '', clickedDate: null
+                    });
+                    setSelectedDates(new Set());
+                    setIsMultiSelectMode(false);
+                    showNotification('success', '儲存成功');
+                } catch (err) {
+                    showNotification('error', '儲存失敗：' + err.message);
+                } finally {
+                    setIsLoading(false);
+                }
+            };
+
+            const onDeleteClick = (target = 'ALL') => {
+                if (!formData.id) return;
+                setDeleteTarget(target);
+                setIsDeleteConfirmOpen(true);
+            };
+
+            const executeDelete = async () => {
+                setIsDeleteConfirmOpen(false);
+                setIsLoading(true);
+                try {
+                    const ref = getCollectionRef();
+                    
+                    if (deleteTarget === 'SINGLE' && formData.clickedDate) {
+                        // Delete Single Day Logic
+                        const targetDateStr = formatDateForInput(formData.clickedDate);
+                        
+                        // 1. Get original range
+                        let curr = new Date(formData.startDate);
+                        const end = new Date(formData.endDate);
+                        const days = [];
+                        
+                        if (curr <= end) {
+                            while(curr <= end) {
+                                // Important: We must respect the original skip logic logic implicitly
+                                // But since we are deleting a specific date from an existing record which is already a range,
+                                // we assume all dates in range are valid. 
+                                // Actually, simpler: Just list all dates, exclude target, regoup.
+                                days.push(formatDateForInput(curr));
+                                curr.setDate(curr.getDate() + 1);
+                            }
+                        } else {
+                             days.push(formData.startDate);
+                        }
+
+                        // 2. Filter out target date
+                        const newDays = days.filter(d => d !== targetDateStr);
+                        
+                        if (newDays.length === 0) {
+                            // If only 1 day and deleted, delete doc
+                             await ref.doc(formData.id).delete();
+                             await addHistoryLog('DELETE', { ...formData, note: `(Deleted ${targetDateStr}) ${formData.note || ''}` });
+                        } else {
+                            // 3. Regroup
+                            const ranges = [];
+                            if (newDays.length > 0) {
+                                let start = newDays[0];
+                                let endRange = newDays[0];
+                                for (let i = 1; i < newDays.length; i++) {
+                                    const current = newDays[i];
+                                    const diff = Date.parse(current) - Date.parse(endRange);
+                                    if (diff === 86400000) { // 1 day diff
+                                        endRange = current;
+                                    } else {
+                                        ranges.push({ startDate: start, endDate: endRange });
+                                        start = current;
+                                        endRange = current;
+                                    }
+                                }
+                                ranges.push({ startDate: start, endDate: endRange });
+                            }
+
+                            // 4. Update
+                            // Update the original doc to be the first range
+                            const firstRange = ranges[0];
+                            const baseData = {
+                                name: formData.name,
+                                type: formData.type,
+                                period: formData.period,
+                                startTime: formData.startTime,
+                                endTime: formData.endTime,
+                                note: formData.note
+                            };
+                            
+                            await ref.doc(formData.id).update({
+                                ...baseData,
+                                startDate: firstRange.startDate,
+                                endDate: firstRange.endDate
+                            });
+
+                            // If split into more ranges, create new docs
+                            for(let i=1; i<ranges.length; i++) {
+                                await ref.add({
+                                    ...baseData,
+                                    startDate: ranges[i].startDate,
+                                    endDate: ranges[i].endDate,
+                                    createdAt: new Date().toISOString()
+                                });
+                            }
+                            
+                            await addHistoryLog('UPDATE', { ...formData, note: `(Removed ${targetDateStr}) ${formData.note || ''}` });
+                        }
+                         showNotification('success', `已取消 ${targetDateStr}`);
+                    } else {
+                        // Default Delete All
+                        try {
+                            await addHistoryLog('DELETE', formData);
+                        } catch(logErr) {
+                            console.warn("Log error:", logErr);
+                        }
+                        await ref.doc(formData.id).delete();
+                        showNotification('success', '刪除成功');
+                    }
+                    
+                    setIsModalOpen(false);
+                    setFormData({ id: null, name: '', type: '2F', startDate: '', endDate: '', note: '', period: 'FULL', startTime: '', endTime: '', clickedDate: null });
+                } catch (err) {
+                    console.error("Delete Error:", err);
+                    showNotification('error', '刪除失敗：' + err.message);
+                } finally {
+                    setIsLoading(false);
+                }
+            };
+
+            const handleSaveConfig = () => {
+                try {
+                    const parsed = JSON.parse(configInput);
+                    if(!parsed.apiKey) throw new Error("缺少 apiKey");
+                    localStorage.setItem(CONFIG_STORAGE_KEY, configInput);
+                    alert("設定已儲存，重新載入...");
+                    window.location.reload();
+                } catch(e) {
+                    alert("JSON 錯誤: " + e.message);
+                }
+            };
+
+            const handleResetConfig = () => {
+                if(confirm("重置為預設金鑰？")) {
+                    localStorage.removeItem(CONFIG_STORAGE_KEY);
+                    window.location.reload();
+                }
+            };
+
+            const year = currentDate.getFullYear();
+            const month = currentDate.getMonth();
+            const daysInMonth = getDaysInMonth(year, month);
+            const firstDay = getFirstDayOfMonth(year, month);
+            
+            const days = useMemo(() => {
+                const arr = [];
+                for(let i=0; i<firstDay; i++) arr.push({ type: 'empty', id: `e-${i}` });
+                for(let i=1; i<=daysInMonth; i++) {
+                    const date = new Date(year, month, i);
+                    const dayLeaves = leaves.filter(l => isDateBetween(date, l.startDate, l.endDate));
+                    
+                    const leaves2F = dayLeaves
+                        .filter(l => l.type === '2F' || (!GROUPS[l.type] && l.type !== 'EVENT'))
+                        .sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || ''));
+                        
+                    const leavesPET = dayLeaves
+                        .filter(l => l.type === 'PET')
+                        .sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || ''));
+                        
+                    const leavesEvent = dayLeaves
+                        .filter(l => l.type === 'EVENT')
+                        .sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || ''));
+
+                    const holiday = getHoliday(date);
+                    const dateStr = formatDateForInput(date);
+                    const isSelected = selectedDates.has(dateStr);
+                    
+                    const dayOfWeek = date.getDay();
+                    const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
+                    const isHolidayDay = isWeekend || !!holiday;
+
+                    arr.push({ 
+                        type: 'day', 
+                        date: i, 
+                        fullDate: date, 
+                        leaves2F,    
+                        leavesPET, 
+                        leavesEvent,
+                        holiday, 
+                        isSelected,
+                        isHolidayDay,
+                        id: `d-${i}` 
+                    });
+                }
+                return arr;
+            }, [year, month, leaves, selectedDates]);
+
+            const calculateOverlapDays = (leave, rangeStart, rangeEnd) => {
+                const lStart = new Date(leave.startDate);
+                const lEnd = new Date(leave.endDate);
+                
+                lStart.setHours(0,0,0,0);
+                lEnd.setHours(0,0,0,0);
+                const rStart = new Date(rangeStart);
+                rStart.setHours(0,0,0,0);
+                const rEnd = new Date(rangeEnd);
+                rEnd.setHours(0,0,0,0);
+
+                const actualStart = lStart < rStart ? rStart : lStart;
+                const actualEnd = lEnd > rEnd ? rEnd : lEnd;
+
+                if (actualStart > actualEnd) return 0;
+
+                const diffTime = Math.abs(actualEnd - actualStart);
+                const days = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1;
+                
+                const factor = (leave.period === 'AM' || leave.period === 'PM') ? 0.5 : 1;
+                return days * factor;
+            };
+
+            const reportStats = useMemo(() => {
+                const stats = {};
+                
+                let rangeStart, rangeEnd;
+                if (reportViewType === 'year') {
+                    rangeStart = new Date(reportYear, 0, 1);
+                    rangeEnd = new Date(reportYear, 11, 31);
+                } else {
+                    rangeStart = new Date(reportYear, reportMonth, 1);
+                    rangeEnd = new Date(reportYear, reportMonth + 1, 0); 
+                }
+
+                const filteredLeaves = leaves.filter(l => {
+                    if (l.type === 'EVENT') return false; 
+                    const lStart = new Date(l.startDate);
+                    const lEnd = new Date(l.endDate);
+                    return lStart <= rangeEnd && lEnd >= rangeStart;
+                });
+
+                filteredLeaves.forEach(l => {
+                    const name = l.name || "Unknown";
+                    if (!stats[name]) {
+                        stats[name] = { name, total: 0, group2F: 0, groupPET: 0 };
+                    }
+                    
+                    const lStart = new Date(l.startDate);
+                    const lEnd = new Date(l.endDate);
+                    
+                    lStart.setHours(0,0,0,0);
+                    lEnd.setHours(0,0,0,0);
+                    const rStart = new Date(rangeStart);
+                    rStart.setHours(0,0,0,0);
+                    const rEnd = new Date(rangeEnd);
+                    rEnd.setHours(0,0,0,0);
+
+                    const actualStart = lStart < rStart ? rStart : lStart;
+                    const actualEnd = lEnd > rEnd ? rEnd : lEnd;
+
+                    if (actualStart <= actualEnd) {
+                        let workingDays = 0;
+                        let curr = new Date(actualStart);
+                        while (curr <= actualEnd) {
+                            if (!checkIsHoliday(curr)) {
+                                workingDays++;
+                            }
+                            curr.setDate(curr.getDate() + 1);
+                        }
+                        
+                        const factor = (l.period === 'AM' || l.period === 'PM') ? 0.5 : 1;
+                        const days = workingDays * factor;
+
+                        if (days > 0) {
+                            stats[name].total += days;
+                            if (l.type === 'PET') {
+                                stats[name].groupPET += days;
+                            } else {
+                                stats[name].group2F += days;
+                            }
+                        }
+                    }
+                });
+
+                return Object.values(stats).sort((a, b) => b.total - a.total);
+            }, [leaves, reportYear, reportMonth, reportViewType]);
+
+            const handleDayClick = (date, defaultType = null) => {
+                if(syncStatus !== 'connected') { 
+                    showNotification('error', '請檢查連線');
+                    if(syncStatus === 'error') handleOpenConfig(); 
+                    return; 
+                }
+
+                if (isMultiSelectMode) {
+                    const dateStr = formatDateForInput(date);
+                    const newSet = new Set(selectedDates);
+                    if (newSet.has(dateStr)) {
+                        newSet.delete(dateStr);
+                    } else {
+                        if (newSet.size >= 20) {
+                            showNotification('error', '一次最多選擇 20 天');
+                            return;
+                        }
+                        newSet.add(dateStr);
+                    }
+                    setSelectedDates(newSet);
+                } else {
+                    const str = formatDateForInput(date);
+                    const isHoliday = checkIsHoliday(new Date(date));
+                    const type = defaultType ? defaultType : (isHoliday ? 'EVENT' : '2F');
+                    
+                    setFormData({ 
+                        id: null, name: '', type: type, startDate: str, endDate: str, 
+                        note: '', period: 'FULL', startTime: '', endTime: '', clickedDate: date // Pass date object
+                    });
+                    setIsModalOpen(true);
+                }
+            };
+
+            const toggleMultiSelectMode = () => {
+                if (isMultiSelectMode) {
+                    setIsMultiSelectMode(false);
+                    setSelectedDates(new Set());
+                } else {
+                    setIsMultiSelectMode(true);
+                }
+            };
+
+            const openBulkModal = () => {
+                if (selectedDates.size === 0) return;
+                setFormData({ 
+                    id: null, name: '', type: '2F', startDate: '', endDate: '', 
+                    note: '', period: 'FULL', startTime: '', endTime: '', clickedDate: null
+                });
+                setIsModalOpen(true);
+            };
+
+            const openEdit = (e, leave, date) => { // Updated to accept date
+                e.stopPropagation();
+                if (isMultiSelectMode) return;
+                setFormData({ 
+                    ...leave, 
+                    period: leave.period || 'FULL',
+                    startTime: leave.startTime || '',
+                    endTime: leave.endTime || '',
+                    clickedDate: date // Capture the clicked date
+                });
+                setIsModalOpen(true);
+            };
+
+            const handleTouchStart = (e) => {
+                if (e.touches.length > 1) return;
+                touchStartRef.current = { 
+                    x: e.changedTouches[0].clientX, 
+                    y: e.changedTouches[0].clientY 
+                };
+            };
+
+            const handleTouchEnd = (e) => {
+                const touchEnd = { 
+                    x: e.changedTouches[0].clientX, 
+                    y: e.changedTouches[0].clientY 
+                };
+                
+                const dx = touchStartRef.current.x - touchEnd.x;
+                const dy = touchStartRef.current.y - touchEnd.y;
+                
+                if (Math.abs(dx) > Math.abs(dy) && Math.abs(dx) > 50) {
+                    if (dx > 0) {
+                        setCurrentDate(d => new Date(d.getFullYear(), d.getMonth() + 1, 1));
+                    } else {
+                        setCurrentDate(d => new Date(d.getFullYear(), d.getMonth() - 1, 1));
+                    }
+                }
+            };
+
+            // Summary Modal Logic
+            const summaryLeaves = useMemo(() => {
+                if (!summaryDate) return [];
+                return leaves.filter(l => isDateBetween(summaryDate, l.startDate, l.endDate));
+            }, [leaves, summaryDate]);
+
+            return (
+                <div className="min-h-screen pb-12 flex flex-col">
+                    <header className="bg-white shadow-sm sticky top-0 z-20 border-b border-gray-100">
+                        <div className="max-w-4xl mx-auto px-4 py-3">
+                            <div className="flex justify-between items-center mb-3">
+                                <div className="flex items-center gap-2">
+                                    <div className="bg-indigo-600 p-1.5 rounded-lg text-white shadow-md">
+                                        <Icon name="Calendar" size={20} className="text-white" />
+                                    </div>
+                                    <h1 className="text-lg font-bold text-gray-800 tracking-tight">核醫請假行事曆</h1>
+                                </div>
+                                <div className="flex gap-2">
+                                    <button onClick={() => setIsReportOpen(true)} className="flex items-center gap-1 px-3 py-1.5 rounded-full text-xs font-bold bg-indigo-50 text-indigo-600 border border-indigo-200 hover:bg-indigo-100 transition-all active:scale-95">
+                                        <Icon name="BarChart3" size={14} /> 報表
+                                    </button>
+                                    <button onClick={() => setIsHistoryOpen(true)} className="flex items-center gap-1 px-3 py-1.5 rounded-full text-xs font-bold bg-white text-gray-600 border border-gray-200 hover:bg-gray-50 transition-all active:scale-95">
+                                        <Icon name="History" size={14} /> 歷史
+                                    </button>
+                                    <button onClick={handleOpenConfig} className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-bold transition-all border shadow-sm ${syncStatus === 'connected' ? 'bg-emerald-50 text-emerald-700 border-emerald-200 hover:bg-emerald-100' : (syncStatus === 'error' ? 'bg-rose-50 text-rose-700 border-rose-200 animate-pulse' : 'bg-gray-100 text-gray-500')}`}>
+                                        <div className={`w-2 h-2 rounded-full ${syncStatus === 'connected' ? 'bg-emerald-500' : 'bg-rose-500'}`}></div>
+                                        <Icon name="Settings" size={12} className="opacity-50"/>
+                                    </button>
+                                </div>
+                            </div>
+
+                            <div className="flex items-center justify-between gap-2">
+                                <div className="flex items-center bg-white rounded-xl p-1 border border-gray-200 shadow-sm">
+                                    <button onClick={() => setCurrentDate(new Date(year, month-1, 1))} className="w-10 h-10 flex items-center justify-center hover:bg-gray-50 rounded-lg text-gray-500 hover:text-indigo-600 transition-all active:scale-95 font-bold text-xl font-mono">&lt;</button>
+                                    <span 
+                                        className="w-32 text-center font-bold text-gray-800 text-lg select-none tracking-tight"
+                                    >
+                                        {year}年 {month+1}月
+                                    </span>
+                                    <button onClick={() => setCurrentDate(new Date(year, month+1, 1))} className="w-10 h-10 flex items-center justify-center hover:bg-gray-50 rounded-lg text-gray-500 hover:text-indigo-600 transition-all active:scale-95 font-bold text-xl font-mono">&gt;</button>
+                                </div>
+                                <div className="flex gap-2">
+                                    <button onClick={toggleMultiSelectMode} className={`px-3 py-2 text-xs font-bold rounded-lg shadow-sm flex items-center gap-1 active:scale-95 transition-all ${isMultiSelectMode ? 'bg-orange-500 text-white hover:bg-orange-600 ring-2 ring-orange-200' : 'bg-white text-gray-600 border border-gray-300 hover:bg-gray-50'}`}>
+                                        <Icon name={isMultiSelectMode ? "CheckCircle2" : "MousePointer2"} size={14} />
+                                        {isMultiSelectMode ? `多選模式` : "多選模式"}
+                                    </button>
+                                    
+                                    {isMultiSelectMode && selectedDates.size > 0 ? (
+                                        <button onClick={openBulkModal} className="px-3 py-2 text-xs font-bold text-white bg-indigo-600 rounded-lg hover:bg-indigo-700 shadow-sm flex items-center gap-1 active:scale-95 transition-transform animate-bounce">
+                                            <Icon name="PenSquare" size={14} /> 填寫假單 ({selectedDates.size})
+                                        </button>
+                                    ) : (
+                                        <>
+                                            <button onClick={() => {
+                                                const today = new Date();
+                                                setCurrentDate(today);
+                                                setSummaryDate(today);
+                                            }} className="px-3 py-2 text-xs font-medium text-gray-600 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 hidden sm:block">今天</button>
+                                            {!isMultiSelectMode && (
+                                                <button onClick={() => {
+                                                    const str = formatDateForInput(new Date());
+                                                    setFormData({ id: null, name: '', type: '2F', startDate: str, endDate: str, note: '', period: 'FULL', startTime: '', endTime: '', clickedDate: null });
+                                                    setIsModalOpen(true);
+                                                }} className="px-3 py-2 text-xs font-bold text-white bg-indigo-600 rounded-lg hover:bg-indigo-700 shadow-sm flex items-center gap-1 active:scale-95 transition-transform">
+                                                    <Icon name="Plus" size={14} className="text-white" /> 新增
+                                                </button>
+                                            )}
+                                        </>
+                                    )}
+                                </div>
+                            </div>
+                            {isMultiSelectMode && (
+                                <div className="text-center mt-2 text-xs text-orange-600 font-bold bg-orange-50 py-1 rounded">
+                                    💡 點選日期格子進行多選 (已選 {selectedDates.size}/20 天)
+                                </div>
+                            )}
+                        </div>
+                    </header>
+
+                    <main className="max-w-4xl mx-auto w-full px-2 sm:px-4 py-4 flex-grow touch-pan-y" onTouchStart={handleTouchStart} onTouchEnd={handleTouchEnd}>
+                        <div className="calendar-grid mb-2 px-1">
+                            {['日', '一', '二', '三', '四', '五', '六'].map((d, i) => (
+                                <div key={i} className={`text-center text-xs font-bold ${i===0||i===6 ? 'text-orange-500':'text-gray-400'}`}>
+                                    {d}
+                                </div>
+                            ))}
+                        </div>
+
+                        <div className={`calendar-grid gap-[1px] bg-gray-200 border border-gray-200 rounded-xl overflow-hidden shadow-sm transition-all select-none ${isMultiSelectMode ? 'ring-2 ring-orange-400 ring-offset-2' : ''}`}>
+                            {days.map((day) => (
+                                <div 
+                                    key={day.id}
+                                    onClick={() => day.type === 'day' && handleDayClick(day.fullDate)}
+                                    className={`min-h-[140px] sm:min-h-[180px] relative group transition-colors flex flex-col ${day.type === 'empty' ? 'bg-gray-50/80' : 'hover:bg-gray-50 cursor-pointer'} ${day.isHolidayDay ? 'bg-gray-50' : 'bg-white'} ${day.type === 'day' && day.fullDate.toDateString() === new Date().toDateString() ? 'ring-2 ring-indigo-300 z-10' : ''} ${day.isSelected ? 'bg-orange-100 ring-inset ring-2 ring-orange-500' : ''}`}
+                                >
+                                    {day.type === 'day' && (
+                                        <>
+                                            <div className="flex flex-col items-start p-1.5 mb-0.5 gap-1">
+                                                <span 
+                                                    onClick={(e) => {
+                                                        e.stopPropagation();
+                                                        setSummaryDate(day.fullDate);
+                                                    }}
+                                                    className={`text-sm w-6 h-6 flex items-center justify-center rounded-full font-bold transition-all cursor-pointer hover:ring-2 hover:ring-indigo-300 ${day.isSelected ? 'bg-orange-500 text-white scale-110 shadow-md' : (day.fullDate.toDateString() === new Date().toDateString() ? 'bg-indigo-600 text-white shadow-sm' : (day.isHolidayDay ? 'text-rose-500' : 'text-gray-700'))}`}
+                                                >
+                                                    {day.date}
+                                                </span>
+                                                {day.holiday && <div className="w-full text-[10px] sm:text-xs font-medium text-rose-600 bg-rose-50/50 px-1 py-0.5 rounded text-left leading-tight break-words">{day.holiday}</div>}
+                                            </div>
+                                            
+                                            <div className="flex flex-col gap-1 px-1 pb-1 flex-grow">
+                                                {day.leavesEvent.map((leave, index) => (
+                                                    <div key={leave.id} onClick={(e) => openEdit(e, leave, day.fullDate)} className={`text-[10px] sm:text-xs px-1.5 py-1 rounded-md border shadow-sm fade-in active:scale-95 transition-transform select-none h-auto bg-purple-50 text-purple-900 border-purple-200 hover:bg-purple-100 mb-0.5 ${isMultiSelectMode ? 'opacity-50' : ''}`}>
+                                                        <div className="flex flex-col items-start w-full">
+                                                            <div className="flex flex-wrap items-baseline gap-0.5 font-bold w-full">
+                                                                <Icon name="Megaphone" size={12} className="text-purple-500 mt-[2px] flex-shrink-0" />
+                                                                <span className="break-all whitespace-normal text-left leading-snug w-full">{leave.name}</span>
+                                                            </div>
+                                                            {leave.note && <div className="text-[9px] text-gray-500 whitespace-normal break-words text-left w-full font-normal leading-tight mt-0.5 pl-4">{leave.note}</div>}
+                                                        </div>
+                                                    </div>
+                                                ))}
+
+                                                {!day.isHolidayDay ? (
+                                                    <>
+                                                        <div onClick={(e) => { e.stopPropagation(); day.type === 'day' && handleDayClick(day.fullDate, '2F'); }} className="bg-blue-50/30 border border-blue-100/50 rounded flex-grow flex flex-col min-h-[40px] hover:ring-2 hover:ring-blue-300 transition-all cursor-pointer">
+                                                            <div className="text-[8px] text-blue-300 font-bold px-1 uppercase tracking-widest leading-none py-0.5">2F</div>
+                                                            <div className="flex flex-col gap-0.5 px-0.5 pb-0.5">
+                                                                {day.leaves2F.map((leave, index) => (
+                                                                    <div key={leave.id} onClick={(e) => openEdit(e, leave, day.fullDate)} className={`text-[10px] sm:text-xs px-1 py-0.5 rounded border shadow-sm fade-in active:scale-95 transition-transform select-none h-auto bg-white text-blue-900 border-blue-200 ${isMultiSelectMode ? 'opacity-50' : 'hover:bg-blue-50'}`}>
+                                                                        <div className="flex flex-col items-start w-full">
+                                                                            <div className="flex flex-wrap items-baseline gap-0.5 font-bold w-full">
+                                                                                <span className="text-[9px] text-blue-400 font-mono flex-shrink-0">{index + 1}.</span>
+                                                                                <span className="break-all whitespace-normal text-left leading-snug w-full">
+                                                                                    {leave.name} 
+                                                                                    {leave.period === 'AM' && <span className="text-[9px] text-gray-400 font-normal ml-0.5">am</span>}
+                                                                                    {leave.period === 'PM' && <span className="text-[9px] text-gray-400 font-normal ml-0.5">pm</span>}
+                                                                                </span>
+                                                                                {(leave.startTime && leave.endTime) && <span className="w-full text-[8.5px] text-blue-400 font-normal bg-blue-50 px-0.5 rounded -mt-0.5 break-normal">{leave.startTime}-{leave.endTime}</span>}
+                                                                            </div>
+                                                                            {leave.note && <div className="text-[9px] text-gray-500 whitespace-normal break-words text-left w-full font-normal leading-tight mt-0.5 pl-3">{leave.note}</div>}
+                                                                        </div>
+                                                                    </div>
+                                                                ))}
+                                                            </div>
+                                                        </div>
+
+                                                        <div onClick={(e) => { e.stopPropagation(); day.type === 'day' && handleDayClick(day.fullDate, 'PET'); }} className="bg-orange-50/30 border border-orange-100/50 rounded flex-grow flex flex-col min-h-[40px] hover:ring-2 hover:ring-orange-300 transition-all cursor-pointer">
+                                                            <div className="text-[8px] text-orange-300 font-bold px-1 uppercase tracking-widest leading-none py-0.5">正子</div>
+                                                            <div className="flex flex-col gap-0.5 px-0.5 pb-0.5">
+                                                                {day.leavesPET.map((leave, index) => (
+                                                                    <div key={leave.id} onClick={(e) => openEdit(e, leave, day.fullDate)} className={`text-[10px] sm:text-xs px-1 py-0.5 rounded border shadow-sm fade-in active:scale-95 transition-transform select-none h-auto bg-white text-orange-900 border-orange-200 ${isMultiSelectMode ? 'opacity-50' : 'hover:bg-orange-50'}`}>
+                                                                        <div className="flex flex-col items-start w-full">
+                                                                            <div className="flex flex-wrap items-baseline gap-0.5 font-bold w-full">
+                                                                                <span className="text-[9px] text-orange-400 font-mono flex-shrink-0">{index + 1}.</span>
+                                                                                <span className="break-all whitespace-normal text-left leading-snug w-full">
+                                                                                    {leave.name} 
+                                                                                    {leave.period === 'AM' && <span className="text-[9px] text-gray-400 font-normal ml-0.5">am</span>}
+                                                                                    {leave.period === 'PM' && <span className="text-[9px] text-gray-400 font-normal ml-0.5">pm</span>}
+                                                                                </span>
+                                                                                {(leave.startTime && leave.endTime) && <span className="w-full text-[8.5px] text-orange-400 font-normal bg-orange-50 px-0.5 rounded -mt-0.5 break-normal">{leave.startTime}-{leave.endTime}</span>}
+                                                                            </div>
+                                                                            {leave.note && <div className="text-[9px] text-gray-500 whitespace-normal break-words text-left w-full font-normal leading-tight mt-0.5 pl-3">{leave.note}</div>}
+                                                                        </div>
+                                                                    </div>
+                                                                ))}
+                                                            </div>
+                                                        </div>
+                                                    </>
+                                                ) : (
+                                                    <div className="flex flex-col gap-0.5 px-0.5">
+                                                        {[...day.leaves2F, ...day.leavesPET].map((leave) => (
+                                                            <div key={leave.id} onClick={(e) => openEdit(e, leave, day.fullDate)} className={`text-[10px] sm:text-xs px-1 py-0.5 rounded border shadow-sm fade-in active:scale-95 transition-transform select-none h-auto bg-white ${leave.type === 'PET' ? 'text-orange-900 border-orange-200' : 'text-blue-900 border-blue-200'} ${isMultiSelectMode ? 'opacity-50' : 'hover:bg-gray-100'}`}>
+                                                                <div className="flex flex-col items-start w-full">
+                                                                    <div className="flex flex-wrap items-baseline gap-0.5 font-bold w-full">
+                                                                        <span className="break-all whitespace-normal text-left leading-snug w-full">
+                                                                            {leave.name} {leave.period === 'AM' && <span className="text-[9px] text-gray-400 font-normal ml-0.5">am</span>} {leave.period === 'PM' && <span className="text-[9px] text-gray-400 font-normal ml-0.5">pm</span>}
+                                                                        </span>
+                                                                        {(leave.startTime && leave.endTime) && <span className="w-full text-[8.5px] opacity-75 font-normal bg-gray-50 px-0.5 rounded -mt-0.5 break-normal">{leave.startTime}-{leave.endTime}</span>}
+                                                                    </div>
+                                                                    {leave.note && <div className="text-[9px] text-gray-500 whitespace-normal break-words text-left w-full font-normal leading-tight mt-0.5">{leave.note}</div>}
+                                                                </div>
+                                                            </div>
+                                                        ))}
+                                                    </div>
+                                                )}
+                                            </div>
+                                        </>
+                                    )}
+                                </div>
+                            ))}
+                        </div>
+                    </main>
+                    
+                    {isLoading && <div className="fixed bottom-4 right-4 bg-white px-4 py-2 rounded-full shadow-lg border border-gray-100 flex items-center gap-3 z-50 fade-in"><Icon name="Loader2" size={16} className="text-indigo-600 spin-slow" /><span className="text-sm text-gray-600 font-medium">同步中...</span></div>}
+                    {notification && <div className={`fixed top-4 left-1/2 transform -translate-x-1/2 px-4 py-2 rounded-lg shadow-lg z-[60] text-white text-sm font-bold fade-in ${notification.type === 'error' ? 'bg-red-500' : 'bg-emerald-500'}`}>{notification.message}</div>}
+
+                    {/* Daily Summary Modal (Replaces Today Summary) */}
+                    {summaryDate && (
+                        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4 fade-in" onClick={() => setSummaryDate(null)}>
+                            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm overflow-hidden flex flex-col max-h-[80vh] relative" onClick={e => e.stopPropagation()}>
+                                <div className="px-5 py-4 border-b bg-gray-50 flex justify-between items-center shrink-0">
+                                    <h3 className="font-bold text-gray-800 text-lg flex items-center gap-2">
+                                        <Icon name="CalendarCheck" size={18} className="text-indigo-600"/> {summaryDate.getMonth() + 1}月{summaryDate.getDate()}日 概況
+                                    </h3>
+                                    <button onClick={() => setSummaryDate(null)} className="text-gray-400 hover:text-gray-600"><Icon name="X" /></button>
+                                </div>
+                                <div className="p-4 overflow-y-auto flex-grow bg-white">
+                                    {/* Date Header */}
+                                    <div className="text-center mb-4">
+                                        <div className="text-sm text-gray-500">
+                                            {summaryDate.getFullYear()}年 &bull; 
+                                            星期{['日', '一', '二', '三', '四', '五', '六'][summaryDate.getDay()]}
+                                            {checkIsHoliday(summaryDate) && <span className="ml-2 px-2 py-0.5 bg-rose-100 text-rose-600 rounded text-xs font-bold">假日</span>}
+                                        </div>
+                                    </div>
+
+                                    {summaryLeaves.length === 0 ? (
+                                        <div className="text-center py-8 text-gray-400 text-sm bg-gray-50 rounded-xl border border-dashed border-gray-200">
+                                            <Icon name="Coffee" size={32} className="mb-2 mx-auto opacity-30" />
+                                            無請假紀錄
+                                        </div>
+                                    ) : (
+                                        <div className="space-y-3">
+                                            {/* Events first */}
+                                            {summaryLeaves.filter(l => l.type === 'EVENT').map(l => (
+                                                <div key={l.id} className="bg-purple-50 border border-purple-100 rounded-xl p-3 flex gap-3 items-start">
+                                                    <div className="bg-purple-200 text-purple-700 p-2 rounded-lg"><Icon name="Megaphone" size={16} /></div>
+                                                    <div>
+                                                        <div className="font-bold text-purple-900">{l.name}</div>
+                                                        {l.note && <div className="text-xs text-purple-600 mt-1">{l.note}</div>}
+                                                    </div>
+                                                </div>
+                                            ))}
+
+                                            {/* Leaves */}
+                                            {summaryLeaves.filter(l => l.type !== 'EVENT').map(l => (
+                                                <div key={l.id} className={`border rounded-xl p-3 flex gap-3 items-start ${l.type === 'PET' ? 'bg-orange-50 border-orange-100' : 'bg-blue-50 border-blue-100'}`}>
+                                                    <div className={`p-2 rounded-lg ${l.type === 'PET' ? 'bg-orange-200 text-orange-700' : 'bg-blue-200 text-blue-700'}`}>
+                                                        <Icon name={l.type === 'PET' ? 'Activity' : 'User'} size={16} />
+                                                    </div>
+                                                    <div className="flex-grow">
+                                                        <div className="flex justify-between items-start">
+                                                            <div className={`font-bold text-lg ${l.type === 'PET' ? 'text-orange-900' : 'text-blue-900'}`}>{l.name}</div>
+                                                            <span className={`text-xs font-bold px-2 py-0.5 rounded-full ${l.type === 'PET' ? 'bg-orange-200 text-orange-800' : 'bg-blue-200 text-blue-800'}`}>
+                                                                {l.type === 'PET' ? '正子' : '2F'}
+                                                            </span>
+                                                        </div>
+                                                        <div className="flex items-center gap-2 mt-1 text-sm font-medium text-gray-600">
+                                                            {l.period === 'AM' && <span className="bg-gray-200 px-1.5 rounded text-xs">上午</span>}
+                                                            {l.period === 'PM' && <span className="bg-gray-200 px-1.5 rounded text-xs">下午</span>}
+                                                            {l.period === 'FULL' && <span className="bg-gray-200 px-1.5 rounded text-xs">全天</span>}
+                                                            {(l.startTime && l.endTime) && <span className="text-xs text-gray-500">{l.startTime} - {l.endTime}</span>}
+                                                        </div>
+                                                        {l.note && <div className="text-xs text-gray-500 mt-1 pt-1 border-t border-gray-200/50">{l.note}</div>}
+                                                    </div>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    )}
+                                </div>
+                                <div className="p-4 border-t bg-gray-50 shrink-0">
+                                    <button onClick={() => setSummaryDate(null)} className="w-full py-2.5 bg-white border border-gray-300 text-gray-600 rounded-xl font-bold hover:bg-gray-100 transition-colors shadow-sm">
+                                        關閉
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Report Modal */}
+                    {isReportOpen && (
+                        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4 fade-in">
+                            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden flex flex-col max-h-[80vh]">
+                                <div className="px-5 py-4 border-b bg-gray-50 flex justify-between items-center shrink-0">
+                                    <h3 className="font-bold text-gray-800 text-lg flex items-center gap-2">
+                                        <Icon name="BarChart3" size={18} /> 請假統計報表
+                                    </h3>
+                                    <button onClick={() => setIsReportOpen(false)} className="text-gray-400 hover:text-gray-600"><Icon name="X" /></button>
+                                </div>
+                                <div className="p-4 bg-white border-b border-gray-100 flex flex-col gap-3">
+                                    <div className="flex bg-gray-100 p-1 rounded-lg self-center">
+                                        <button onClick={() => setReportViewType('year')} className={`px-4 py-1.5 rounded-md text-xs font-bold transition-all ${reportViewType === 'year' ? 'bg-white text-indigo-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}>年度報表</button>
+                                        <button onClick={() => setReportViewType('month')} className={`px-4 py-1.5 rounded-md text-xs font-bold transition-all ${reportViewType === 'month' ? 'bg-white text-indigo-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}>月度報表</button>
+                                    </div>
+                                    <div className="flex justify-center items-center gap-2">
+                                        <button onClick={() => setReportYear(y => y - 1)} className="p-1 hover:bg-gray-100 rounded text-gray-500"><Icon name="ChevronLeft" size={20}/></button>
+                                        <div className="relative">
+                                            <select value={reportYear} onChange={(e) => setReportYear(Number(e.target.value))} className="appearance-none font-bold text-lg text-gray-800 bg-transparent py-1 pl-2 pr-6 cursor-pointer outline-none text-center">
+                                                {yearOptions.map(y => <option key={y} value={y}>{y} 年</option>)}
+                                            </select>
+                                            <div className="absolute right-0 top-1/2 transform -translate-y-1/2 pointer-events-none text-gray-400"><Icon name="ChevronDown" size={12} /></div>
+                                        </div>
+                                        <button onClick={() => setReportYear(y => y + 1)} className="p-1 hover:bg-gray-100 rounded text-gray-500"><Icon name="ChevronRight" size={20}/></button>
+                                    </div>
+                                    {reportViewType === 'month' && (
+                                        <div className="flex justify-center items-center gap-4 animate-fadeIn">
+                                            <button onClick={() => setReportMonth(m => (m === 0 ? 11 : m - 1))} className="p-2 bg-white text-indigo-600 rounded-lg shadow-sm border border-indigo-200 hover:bg-indigo-50 active:scale-95 transition-all"><Icon name="ChevronLeft" size={20}/></button>
+                                            <span className="font-bold text-xl text-indigo-900 w-24 text-center">{reportMonth + 1} 月</span>
+                                            <button onClick={() => setReportMonth(m => (m === 11 ? 0 : m + 1))} className="p-2 bg-white text-indigo-600 rounded-lg shadow-sm border border-indigo-200 hover:bg-indigo-50 active:scale-95 transition-all"><Icon name="ChevronRight" size={20}/></button>
+                                        </div>
+                                    )}
+                                </div>
+                                <div className="p-0 overflow-y-auto flex-grow bg-white">
+                                    <table className="w-full text-sm text-left">
+                                        <thead className="bg-gray-50 text-gray-600 font-bold border-b sticky top-0">
+                                            <tr><th className="px-4 py-3">姓名</th><th className="px-4 py-3 text-center text-blue-600">2F</th><th className="px-4 py-3 text-center text-orange-600">正子</th><th className="px-4 py-3 text-right">總計</th></tr>
+                                        </thead>
+                                        <tbody className="divide-y divide-gray-100">
+                                            {reportStats.map((stat, idx) => (
+                                                <tr key={idx} className="hover:bg-gray-50"><td className="px-4 py-3 font-medium text-gray-800">{stat.name}</td><td className="px-4 py-3 text-center text-gray-600">{stat.group2F > 0 ? stat.group2F : '-'}</td><td className="px-4 py-3 text-center text-gray-600">{stat.groupPET > 0 ? stat.groupPET : '-'}</td><td className="px-4 py-3 text-right font-bold text-indigo-600">{stat.total} 天</td></tr>
+                                            ))}
+                                            {reportStats.length === 0 && <tr><td colSpan="4" className="px-4 py-8 text-center text-gray-400">尚無資料</td></tr>}
+                                        </tbody>
+                                    </table>
+                                </div>
+                                <div className="p-4 border-t bg-gray-50 shrink-0"><button onClick={() => setIsReportOpen(false)} className="w-full py-2.5 bg-white border border-gray-300 text-gray-600 rounded-xl font-bold hover:bg-gray-100 transition-colors shadow-sm">關閉</button></div>
+                            </div>
+                        </div>
+                    )}
+
+                    {isDeleteConfirmOpen && (
+                        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/20 backdrop-blur-[1px] p-4 fade-in">
+                            <div className="bg-white rounded-xl shadow-xl w-full max-w-xs p-5 text-center">
+                                <div className="w-12 h-12 bg-rose-100 text-rose-500 rounded-full flex items-center justify-center mx-auto mb-3"><Icon name="Trash2" size={24} /></div>
+                                <h3 className="font-bold text-gray-800 text-lg mb-1">{deleteTarget === 'SINGLE' && formData.clickedDate ? `僅刪除 ${formatDateForInput(formData.clickedDate)}？` : '確定刪除整筆？'}</h3>
+                                <p className="text-sm text-gray-500 mb-5">{deleteTarget === 'SINGLE' ? '此操作將把這一天從假單中移除，保留其他日期。' : '此動作無法復原。'}</p>
+                                <div className="flex gap-3"><button onClick={() => setIsDeleteConfirmOpen(false)} className="flex-1 py-2 bg-gray-100 text-gray-600 rounded-lg font-bold">取消</button><button onClick={executeDelete} className="flex-1 py-2 bg-rose-500 text-white rounded-lg font-bold shadow-md hover:bg-rose-600">確認刪除</button></div>
+                            </div>
+                        </div>
+                    )}
+
+                    {isHistoryOpen && (
+                        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4 fade-in">
+                            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden flex flex-col max-h-[80vh]">
+                                <div className="px-5 py-4 border-b bg-gray-50 flex justify-between items-center shrink-0">
+                                    <h3 className="font-bold text-gray-800 text-lg flex items-center gap-2"><Icon name="History" size={18} /> 修改歷程</h3>
+                                    <button onClick={() => setIsHistoryOpen(false)} className="text-gray-400 hover:text-gray-600"><Icon name="X" /></button>
+                                </div>
+                                <div className="p-0 overflow-y-auto flex-grow bg-gray-50">
+                                    {historyLogs.length === 0 ? <div className="flex flex-col items-center justify-center h-40 text-gray-400 text-sm"><Icon name="Clock" size={32} className="mb-2 opacity-50"/>尚無紀錄</div> : <div className="divide-y divide-gray-100">
+                                        {historyLogs.map(log => {
+                                            let actionColor = 'bg-gray-100 text-gray-600';
+                                            let actionLabel = log.action;
+                                            if(log.action === 'CREATE' || log.action === 'BATCH_CREATE') { actionColor = 'bg-emerald-100 text-emerald-700'; actionLabel = '新增'; }
+                                            if(log.action === 'UPDATE') { actionColor = 'bg-blue-100 text-blue-700'; actionLabel = '修改'; }
+                                            if(log.action === 'DELETE') { actionColor = 'bg-rose-100 text-rose-700'; actionLabel = '刪除'; }
+                                            return (
+                                                <div key={log.id} className="p-4 bg-white hover:bg-gray-50 transition-colors">
+                                                    <div className="flex justify-between items-start mb-1">
+                                                        <div className="flex items-center gap-2"><span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${actionColor}`}>{actionLabel}</span><span className="text-sm font-bold text-gray-800">{log.details.name}</span><span className="text-xs text-gray-500 bg-gray-100 px-1.5 rounded">{log.details.group}</span></div>
+                                                        <div className="flex flex-col items-end">
+                                                            <span className="text-[10px] text-gray-400 font-mono">{formatTime(log.timestamp)}</span>
+                                                            {log.details.device && (
+                                                                <span className="text-[9px] text-gray-300 flex items-center gap-0.5 mt-0.5">
+                                                                    <Icon name={['iPhone','iPad','Android','手機端'].includes(log.details.device) ? 'Smartphone' : 'Monitor'} size={8} />
+                                                                    {log.details.device}
+                                                                </span>
+                                                            )}
+                                                        </div>
+                                                    </div>
+                                                    <div className="text-xs text-gray-600 pl-1 border-l-2 border-gray-100 ml-1"><div className="flex items-center gap-1 mb-0.5"><Icon name="Calendar" size={10} className="text-gray-400"/>{log.details.date}</div>{log.details.note && <div className="text-gray-500 truncate">備註: {log.details.note}</div>}</div>
+                                                </div>
+                                            );
+                                        })}
+                                    </div>}
+                                </div>
+                                <div className="p-4 border-t bg-white shrink-0"><button onClick={() => setIsHistoryOpen(false)} className="w-full py-2.5 bg-white border border-gray-300 text-gray-600 rounded-xl font-bold hover:bg-gray-200 transition-colors shadow-sm">關閉</button></div>
+                            </div>
+                        </div>
+                    )}
+
+                    {isModalOpen && (
+                        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm p-4 fade-in">
+                            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm overflow-hidden transform transition-all">
+                                <div className="px-5 py-4 border-b bg-gray-50 flex justify-between items-center">
+                                    <h3 className="font-bold text-gray-800 text-lg">{formData.id ? '編輯項目' : (isMultiSelectMode ? `批次新增 (${selectedDates.size}筆)` : '新增項目')}</h3>
+                                    <button onClick={() => setIsModalOpen(false)} className="text-gray-400 hover:text-gray-600"><Icon name="X" /></button>
+                                </div>
+                                <form onSubmit={handleSave} className="p-5 space-y-4">
+                                    {isMultiSelectMode && !formData.id && <div className="bg-orange-50 p-3 rounded-lg text-xs text-orange-800 border border-orange-100 mb-2"><strong>已選擇日期：</strong><div className="mt-1 flex flex-wrap gap-1">{Array.from(selectedDates).sort().map(d => <span key={d} className="bg-white px-1.5 py-0.5 rounded border border-orange-200">{d}</span>)}</div></div>}
+                                    <div><label className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-1 block">{formData.type === 'EVENT' ? '事項標題' : '姓名'}</label>{formData.type === 'EVENT' ? <input required type="text" value={formData.name} onChange={e=>setFormData({...formData, name:e.target.value})} className="w-full bg-gray-50 border border-gray-200 rounded-lg p-2.5 focus:ring-2 focus:ring-indigo-500 outline-none font-medium text-gray-800" placeholder="請輸入活動或通知標題" /> : <><input required type="text" list="staff-names" value={formData.name} onChange={e=>setFormData({...formData, name:e.target.value})} className="w-full bg-gray-50 border border-gray-200 rounded-lg p-2.5 focus:ring-2 focus:ring-indigo-500 outline-none font-medium text-gray-800" placeholder="請選擇或輸入姓名" /><datalist id="staff-names">{STAFF_NAMES.map(name => <option key={name} value={name} />)}</datalist></>}</div>
+                                    <div><label className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-1 block">類別</label><div className="flex gap-2">{Object.entries(GROUPS).map(([key, conf]) => <button key={key} type="button" onClick={() => setFormData({...formData, type: key})} className={`flex-1 py-2 rounded-lg border text-sm font-bold transition-all flex items-center justify-center gap-2 ${formData.type === key ? `${conf.color.split(' ')[0]} ${conf.color.split(' ')[1]} border-current ring-1 ring-current` : 'bg-white text-gray-500 border-gray-200 hover:bg-gray-50'}`}><Icon name={conf.icon} size={16} />{conf.label}</button>)}</div></div>
+                                    {(formData.type === '2F' || formData.type === 'PET') && <div className={`p-2 rounded-lg border ${formData.type === '2F' ? 'bg-blue-50/50 border-blue-100' : 'bg-orange-50/50 border-orange-100'}`}><label className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-1 block">請假時段</label><div className="flex gap-2">{Object.entries(PERIODS).map(([val, conf]) => <label key={val} className={`flex-1 flex items-center justify-center gap-1 p-1.5 rounded-md cursor-pointer border transition-all text-xs font-bold ${formData.period === val ? 'bg-white border-gray-400 text-gray-800 shadow-sm ring-1 ring-gray-400' : 'bg-transparent border-transparent text-gray-500 hover:bg-white/50'}`}><input type="radio" name="period" value={val} checked={formData.period === val} onChange={() => setFormData({...formData, period: val})} className="hidden"/>{conf.label}</label>)}</div></div>}
+                                    {(!isMultiSelectMode || formData.id) && <div className="grid grid-cols-2 gap-3"><div><label className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-1 block">開始日期</label><input required type="date" value={formData.startDate} onChange={e=>setFormData({...formData, startDate:e.target.value})} className="w-full bg-gray-50 border border-gray-200 rounded-lg p-2 focus:ring-2 focus:ring-indigo-500 outline-none text-sm" /></div><div><label className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-1 block">結束日期</label><input required type="date" value={formData.endDate} min={formData.startDate} onChange={e=>setFormData({...formData, endDate:e.target.value})} className="w-full bg-gray-50 border border-gray-200 rounded-lg p-2 focus:ring-2 focus:ring-indigo-500 outline-none text-sm" /></div></div>}
+                                    <div className="bg-gray-50 p-2 rounded-lg border border-gray-200"><label className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-1 block">詳細時間 (選填)</label><div className="flex gap-2 items-center"><select value={formData.startTime} onChange={e=>setFormData({...formData, startTime:e.target.value})} className="w-full bg-white border border-gray-200 rounded p-1.5 text-sm outline-none focus:ring-1 focus:ring-indigo-500"><option value="">-- 開始 --</option>{TIME_OPTIONS.map(t => <option key={t} value={t}>{t}</option>)}</select><span className="text-gray-400">~</span><select value={formData.endTime} onChange={e=>setFormData({...formData, endTime:e.target.value})} className="w-full bg-white border border-gray-200 rounded p-1.5 text-sm outline-none focus:ring-1 focus:ring-indigo-500"><option value="">-- 結束 --</option>{TIME_OPTIONS.map(t => <option key={t} value={t}>{t}</option>)}</select></div></div>
+                                    <div><label className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-1 block">{formData.type === 'EVENT' ? '詳細內容' : '備註'}</label><textarea value={formData.note} onChange={e=>setFormData({...formData, note:e.target.value})} className="w-full bg-gray-50 border border-gray-200 rounded-lg p-2.5 focus:ring-2 focus:ring-indigo-500 outline-none text-sm h-20 resize-none" placeholder={formData.type === 'EVENT' ? "活動詳情或說明..." : "職務代理人或其他..."}></textarea></div>
+                                    <div className="flex gap-3 pt-2">{formData.id && <button type="button" onClick={onDeleteClick} className="flex-1 py-2.5 bg-rose-50 text-rose-600 rounded-xl font-bold hover:bg-rose-100 transition-colors">刪除</button>}<button type="button" onClick={() => setIsModalOpen(false)} className="flex-1 py-2.5 bg-gray-100 text-gray-600 rounded-xl font-bold hover:bg-gray-200 transition-colors">取消</button><button type="submit" className="flex-[2] py-2.5 bg-indigo-600 text-white rounded-xl font-bold hover:bg-indigo-700 shadow-lg shadow-indigo-200 transition-all active:scale-95">{formData.id ? '更新儲存' : (isMultiSelectMode ? '確認批次新增' : '確認新增')}</button></div>
+                                </form>
+                            </div>
+                        </div>
+                    )}
+
+                    {isConfigOpen && (
+                        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-6 fade-in">
+                            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg overflow-hidden">
+                                <div className="px-6 py-4 border-b flex justify-between items-center bg-gray-50"><h3 className="font-bold text-gray-800 flex items-center gap-2"><Icon name="Database" size={18}/> 系統連線設定</h3><button onClick={() => setIsConfigOpen(false)} className="text-gray-400 hover:text-gray-600"><Icon name="X" /></button></div>
+                                <div className="p-6">{syncStatus === 'error' && <div className="bg-rose-50 p-4 rounded-xl text-sm text-rose-800 mb-4 border border-rose-100"><strong className="flex items-center gap-1 mb-1"><Icon name="AlertTriangle" size={14}/> 連線錯誤</strong>{errorMsg}</div>}<div className="mb-4"><label className="text-sm font-bold text-gray-700 block mb-2">Firebase Config JSON</label><textarea value={configInput} onChange={e=>setConfigInput(e.target.value)} className="w-full h-40 bg-gray-50 border border-gray-200 rounded-xl p-3 font-mono text-xs focus:ring-2 focus:ring-indigo-500 outline-none mb-2" placeholder="請在此貼上設定..."></textarea><p className="text-xs text-gray-500">預設已使用您填寫的金鑰或環境變數。若需更換資料庫請在此修改。</p></div><div className="flex justify-end gap-3"><button onClick={handleResetConfig} className="px-4 py-2 text-gray-500 hover:bg-gray-100 rounded-lg text-sm font-medium">重置預設</button><button onClick={handleSaveConfig} className="px-6 py-2 bg-indigo-600 text-white rounded-lg text-sm font-bold shadow-md hover:bg-indigo-700">儲存並連線</button></div></div>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
