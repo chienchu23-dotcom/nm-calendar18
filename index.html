@@ -218,6 +218,10 @@
 
         // --- 6. Main Application ---
         const App = () => {
+            // --- NEW: Generate a unique Session ID for this window ---
+            const SESSION_ID = useMemo(() => Math.random().toString(36).substr(2, 9), []);
+            const isHistoryInit = useRef(true);
+
             const [currentDate, setCurrentDate] = useState(new Date());
             const [leaves, setLeaves] = useState([]);
             
@@ -225,6 +229,7 @@
             const [isConfigOpen, setIsConfigOpen] = useState(false);
             const [isHistoryOpen, setIsHistoryOpen] = useState(false);
             const [isReportOpen, setIsReportOpen] = useState(false); 
+            const [unreadCount, setUnreadCount] = useState(0); // New State: Notifications
             
             // New state for Daily Summary
             const [summaryDate, setSummaryDate] = useState(null);
@@ -258,9 +263,7 @@
 
             // Report States
             const [reportYear, setReportYear] = useState(Math.max(2026, new Date().getFullYear()));
-            const [reportMonth, setReportMonth] = useState(new Date().getMonth());
-            const [reportViewType, setReportViewType] = useState('year'); // 'year' or 'month'
-
+            
             const yearOptions = useMemo(() => {
                 const startYear = 2026;
                 const currentYear = new Date().getFullYear();
@@ -399,6 +402,7 @@
 
                     await historyRef.add({
                         action,
+                        sessionId: SESSION_ID, // Add session ID here
                         timestamp: new Date().toISOString(),
                         details: {
                             name: leaveData.name || '無名氏',
@@ -413,15 +417,40 @@
                 }
             };
 
+            // Modified History Sync Effect
             useEffect(() => {
-                if (!isHistoryOpen || !dbInstance) return;
+                if (!dbInstance) return; // Always run if DB is ready
+                
                 const historyRef = dbInstance.collection('artifacts').doc(currentAppId).collection('public').doc('data').collection('history');
                 const unsubscribe = historyRef.orderBy('timestamp', 'desc').limit(50).onSnapshot(snapshot => {
                     const logs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
                     setHistoryLogs(logs);
+
+                    // Check for notifications
+                    if (isHistoryInit.current) {
+                        isHistoryInit.current = false;
+                        return; // Skip initial load
+                    }
+
+                    snapshot.docChanges().forEach(change => {
+                        if (change.type === 'added') {
+                            const data = change.doc.data();
+                            // Modified: Notify for ALL changes regardless of session
+                            let actionText = '更新';
+                            if (data.action === 'CREATE' || data.action === 'BATCH_CREATE') actionText = '新增';
+                            else if (data.action === 'DELETE') actionText = '刪除';
+                            else if (data.action === 'UPDATE') actionText = '修改';
+                            
+                            showNotification('info', `${data.details.name} ${actionText}了資料`);
+                            
+                            // Increment unread count for ALL changes
+                            setUnreadCount(prev => prev + 1);
+                        }
+                    });
+
                 });
                 return () => unsubscribe();
-            }, [isHistoryOpen]);
+            }, [dbInstance]); 
 
             const getCollectionRef = () => {
                 if (!dbInstance) throw new Error("Database not initialized");
@@ -838,14 +867,9 @@
             const reportStats = useMemo(() => {
                 const stats = {};
                 
-                let rangeStart, rangeEnd;
-                if (reportViewType === 'year') {
-                    rangeStart = new Date(reportYear, 0, 1);
-                    rangeEnd = new Date(reportYear, 11, 31);
-                } else {
-                    rangeStart = new Date(reportYear, reportMonth, 1);
-                    rangeEnd = new Date(reportYear, reportMonth + 1, 0); 
-                }
+                // Define Report Range (Yearly)
+                let rangeStart = new Date(reportYear, 0, 1);
+                let rangeEnd = new Date(reportYear, 11, 31);
 
                 const filteredLeaves = leaves.filter(l => {
                     if (l.type === 'EVENT') return false; 
@@ -898,7 +922,7 @@
                 });
 
                 return Object.values(stats).sort((a, b) => b.total - a.total);
-            }, [leaves, reportYear, reportMonth, reportViewType]);
+            }, [leaves, reportYear]);
 
             const handleDayClick = (date, defaultType = null) => {
                 if(syncStatus !== 'connected') { 
@@ -1011,8 +1035,10 @@
                                     <button onClick={() => setIsReportOpen(true)} className="flex items-center gap-1 px-3 py-1.5 rounded-full text-xs font-bold bg-indigo-50 text-indigo-600 border border-indigo-200 hover:bg-indigo-100 transition-all active:scale-95">
                                         <Icon name="BarChart3" size={14} /> 報表
                                     </button>
-                                    <button onClick={() => setIsHistoryOpen(true)} className="flex items-center gap-1 px-3 py-1.5 rounded-full text-xs font-bold bg-white text-gray-600 border border-gray-200 hover:bg-gray-50 transition-all active:scale-95">
-                                        <Icon name="History" size={14} /> 歷史
+                                    <button onClick={() => { setIsHistoryOpen(true); setUnreadCount(0); }} className="relative flex items-center gap-1 px-3 py-1.5 rounded-full text-xs font-bold bg-white text-gray-600 border border-gray-200 hover:bg-gray-50 transition-all active:scale-95">
+                                        <Icon name="Bell" size={14} /> 
+                                        通知
+                                        {unreadCount > 0 && <span className="absolute -top-1 -right-1 flex h-4 w-4 items-center justify-center rounded-full bg-red-500 text-[10px] text-white shadow-sm">{unreadCount}</span>}
                                     </button>
                                     <button onClick={handleOpenConfig} className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-bold transition-all border shadow-sm ${syncStatus === 'connected' ? 'bg-emerald-50 text-emerald-700 border-emerald-200 hover:bg-emerald-100' : (syncStatus === 'error' ? 'bg-rose-50 text-rose-700 border-rose-200 animate-pulse' : 'bg-gray-100 text-gray-500')}`}>
                                         <div className={`w-2 h-2 rounded-full ${syncStatus === 'connected' ? 'bg-emerald-500' : 'bg-rose-500'}`}></div>
@@ -1198,7 +1224,6 @@
                                     <button onClick={() => setSummaryDate(null)} className="text-gray-400 hover:text-gray-600"><Icon name="X" /></button>
                                 </div>
                                 <div className="p-4 overflow-y-auto flex-grow bg-white">
-                                    {/* Date Header */}
                                     <div className="text-center mb-4">
                                         <div className="text-sm text-gray-500">
                                             {summaryDate.getFullYear()}年 &bull; 
@@ -1214,7 +1239,6 @@
                                         </div>
                                     ) : (
                                         <div className="space-y-3">
-                                            {/* Events first */}
                                             {summaryLeaves.filter(l => l.type === 'EVENT').map(l => (
                                                 <div key={l.id} className="bg-purple-50 border border-purple-100 rounded-xl p-3 flex gap-3 items-start">
                                                     <div className="bg-purple-200 text-purple-700 p-2 rounded-lg"><Icon name="Megaphone" size={16} /></div>
@@ -1225,7 +1249,6 @@
                                                 </div>
                                             ))}
 
-                                            {/* Leaves */}
                                             {summaryLeaves.filter(l => l.type !== 'EVENT').map(l => (
                                                 <div key={l.id} className={`border rounded-xl p-3 flex gap-3 items-start ${l.type === 'PET' ? 'bg-orange-50 border-orange-100' : 'bg-blue-50 border-blue-100'}`}>
                                                     <div className={`p-2 rounded-lg ${l.type === 'PET' ? 'bg-orange-200 text-orange-700' : 'bg-blue-200 text-blue-700'}`}>
@@ -1271,10 +1294,6 @@
                                     <button onClick={() => setIsReportOpen(false)} className="text-gray-400 hover:text-gray-600"><Icon name="X" /></button>
                                 </div>
                                 <div className="p-4 bg-white border-b border-gray-100 flex flex-col gap-3">
-                                    <div className="flex bg-gray-100 p-1 rounded-lg self-center">
-                                        <button onClick={() => setReportViewType('year')} className={`px-4 py-1.5 rounded-md text-xs font-bold transition-all ${reportViewType === 'year' ? 'bg-white text-indigo-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}>年度報表</button>
-                                        <button onClick={() => setReportViewType('month')} className={`px-4 py-1.5 rounded-md text-xs font-bold transition-all ${reportViewType === 'month' ? 'bg-white text-indigo-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}>月度報表</button>
-                                    </div>
                                     <div className="flex justify-center items-center gap-2">
                                         <button onClick={() => setReportYear(y => y - 1)} className="p-1 hover:bg-gray-100 rounded text-gray-500"><Icon name="ChevronLeft" size={20}/></button>
                                         <div className="relative">
@@ -1285,13 +1304,6 @@
                                         </div>
                                         <button onClick={() => setReportYear(y => y + 1)} className="p-1 hover:bg-gray-100 rounded text-gray-500"><Icon name="ChevronRight" size={20}/></button>
                                     </div>
-                                    {reportViewType === 'month' && (
-                                        <div className="flex justify-center items-center gap-4 animate-fadeIn">
-                                            <button onClick={() => setReportMonth(m => (m === 0 ? 11 : m - 1))} className="p-2 bg-white text-indigo-600 rounded-lg shadow-sm border border-indigo-200 hover:bg-indigo-50 active:scale-95 transition-all"><Icon name="ChevronLeft" size={20}/></button>
-                                            <span className="font-bold text-xl text-indigo-900 w-24 text-center">{reportMonth + 1} 月</span>
-                                            <button onClick={() => setReportMonth(m => (m === 11 ? 0 : m + 1))} className="p-2 bg-white text-indigo-600 rounded-lg shadow-sm border border-indigo-200 hover:bg-indigo-50 active:scale-95 transition-all"><Icon name="ChevronRight" size={20}/></button>
-                                        </div>
-                                    )}
                                 </div>
                                 <div className="p-0 overflow-y-auto flex-grow bg-white">
                                     <table className="w-full text-sm text-left">
