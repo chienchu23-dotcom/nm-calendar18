@@ -39,6 +39,12 @@
             from { opacity: 0; transform: translateY(5px); }
             to { opacity: 1; transform: translateY(0); }
         }
+
+        .bounce-in { animation: bounceIn 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275); }
+        @keyframes bounceIn {
+            0% { opacity: 0; transform: translate(-50%, -20px); }
+            100% { opacity: 1; transform: translate(-50%, 0); }
+        }
         
         .spin-slow { animation: spin 2s linear infinite; }
         @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
@@ -229,8 +235,11 @@
             const [isConfigOpen, setIsConfigOpen] = useState(false);
             const [isHistoryOpen, setIsHistoryOpen] = useState(false);
             const [isReportOpen, setIsReportOpen] = useState(false); 
-            const [unreadCount, setUnreadCount] = useState(0); // New State: Notifications
+            const [unreadCount, setUnreadCount] = useState(0); 
             
+            // New State for Last Read Timestamp
+            const [lastReadTime, setLastReadTime] = useState(new Date().toISOString());
+
             // New state for Daily Summary
             const [summaryDate, setSummaryDate] = useState(null);
             
@@ -277,6 +286,13 @@
             }, []);
 
             const touchStartRef = useRef({ x: 0, y: 0 });
+            
+            // Ref to track isHistoryOpen without re-triggering effects
+            const isHistoryOpenRef = useRef(isHistoryOpen);
+            useEffect(() => {
+                isHistoryOpenRef.current = isHistoryOpen;
+            }, [isHistoryOpen]);
+
 
             const checkIsHoliday = (d) => {
                 const day = d.getDay();
@@ -287,7 +303,7 @@
 
             const showNotification = (type, message) => {
                 setNotification({ type, message });
-                setTimeout(() => setNotification(null), 3000);
+                setTimeout(() => setNotification(null), 4000); // 延長顯示時間方便閱讀
             };
 
             const handleOpenConfig = () => {
@@ -402,7 +418,7 @@
 
                     await historyRef.add({
                         action,
-                        sessionId: SESSION_ID, // Add session ID here
+                        sessionId: SESSION_ID, 
                         timestamp: new Date().toISOString(),
                         details: {
                             name: leaveData.name || '無名氏',
@@ -429,7 +445,10 @@
                     // Check for notifications
                     if (isHistoryInit.current) {
                         isHistoryInit.current = false;
-                        return; // Skip initial load
+                        // Initialize lastReadTime to the latest log time on first load to prevent flooding "New"
+                        // Or just keep it as initial state (app load time). 
+                        // Let's keep it as app load time.
+                        return; 
                     }
 
                     snapshot.docChanges().forEach(change => {
@@ -437,20 +456,43 @@
                             const data = change.doc.data();
                             // Modified: Notify for ALL changes regardless of session
                             let actionText = '更新';
-                            if (data.action === 'CREATE' || data.action === 'BATCH_CREATE') actionText = '新增';
-                            else if (data.action === 'DELETE') actionText = '刪除';
-                            else if (data.action === 'UPDATE') actionText = '修改';
+                            let notifyType = 'info'; // Default: Update (Orange/Blue)
+
+                            if (data.action === 'CREATE' || data.action === 'BATCH_CREATE') {
+                                actionText = '新增';
+                                notifyType = 'success'; // Green
+                            }
+                            else if (data.action === 'DELETE') {
+                                actionText = '刪除';
+                                notifyType = 'error'; // Red
+                            }
+                            else if (data.action === 'UPDATE') {
+                                actionText = '修改';
+                                notifyType = 'warning'; // Orange
+                            }
                             
-                            showNotification('info', `${data.details.name} ${actionText}了資料`);
+                            // 新增日期的顯示
+                            const message = `${data.details.name} ${actionText}了 ${data.details.date} 的資料`;
                             
-                            // Increment unread count for ALL changes
-                            setUnreadCount(prev => prev + 1);
+                            showNotification(notifyType, message);
+                            
+                            // Only increment unread count if history modal is NOT open
+                            if (!isHistoryOpenRef.current) {
+                                setUnreadCount(prev => prev + 1);
+                            }
                         }
                     });
 
                 });
                 return () => unsubscribe();
             }, [dbInstance]); 
+
+            // Function to close history and mark all as read
+            const handleCloseHistory = () => {
+                setIsHistoryOpen(false);
+                setUnreadCount(0);
+                setLastReadTime(new Date().toISOString());
+            };
 
             const getCollectionRef = () => {
                 if (!dbInstance) throw new Error("Database not initialized");
@@ -653,7 +695,7 @@
                     });
                     setSelectedDates(new Set());
                     setIsMultiSelectMode(false);
-                    showNotification('success', '儲存成功');
+                    // showNotification('success', '儲存成功'); // Removed duplicate success toast
                 } catch (err) {
                     showNotification('error', '儲存失敗：' + err.message);
                 } finally {
@@ -723,7 +765,6 @@
                             }
 
                             // 4. Update
-                            // Update the original doc to be the first range
                             const firstRange = ranges[0];
                             const baseData = {
                                 name: formData.name,
@@ -867,7 +908,7 @@
             const reportStats = useMemo(() => {
                 const stats = {};
                 
-                // Define Report Range (Yearly)
+                // Define Report Range (Always Year)
                 let rangeStart = new Date(reportYear, 0, 1);
                 let rangeEnd = new Date(reportYear, 11, 31);
 
@@ -1211,7 +1252,39 @@
                     </main>
                     
                     {isLoading && <div className="fixed bottom-4 right-4 bg-white px-4 py-2 rounded-full shadow-lg border border-gray-100 flex items-center gap-3 z-50 fade-in"><Icon name="Loader2" size={16} className="text-indigo-600 spin-slow" /><span className="text-sm text-gray-600 font-medium">同步中...</span></div>}
-                    {notification && <div className={`fixed top-4 left-1/2 transform -translate-x-1/2 px-4 py-2 rounded-lg shadow-lg z-[60] text-white text-sm font-bold fade-in ${notification.type === 'error' ? 'bg-red-500' : 'bg-emerald-500'}`}>{notification.message}</div>}
+                    
+                    {/* Enhanced Toast Notification */}
+                    {notification && (
+                        <div className={`
+                            fixed top-6 left-1/2 transform -translate-x-1/2 
+                            px-6 py-4 rounded-2xl shadow-2xl z-[70] 
+                            flex items-center gap-4 min-w-[300px] max-w-[90vw]
+                            border-l-4 backdrop-blur-sm animate-bounce-in
+                            ${notification.type === 'error' ? 'bg-white border-rose-500 text-rose-800' : 
+                              notification.type === 'success' ? 'bg-white border-emerald-500 text-emerald-800' : 
+                              notification.type === 'warning' ? 'bg-white border-orange-500 text-orange-800' :
+                              'bg-white border-blue-500 text-blue-800'}
+                        `}>
+                            <div className={`p-2 rounded-full shrink-0 ${
+                                notification.type === 'error' ? 'bg-rose-100 text-rose-600' : 
+                                notification.type === 'success' ? 'bg-emerald-100 text-emerald-600' : 
+                                notification.type === 'warning' ? 'bg-orange-100 text-orange-600' :
+                                'bg-blue-100 text-blue-600'
+                            }`}>
+                                <Icon name={
+                                    notification.type === 'error' ? 'Trash2' : 
+                                    notification.type === 'success' ? 'CheckCircle2' : 
+                                    notification.type === 'warning' ? 'Edit3' : 'Bell'
+                                } size={24} />
+                            </div>
+                            <div className="flex-grow">
+                                <p className="font-bold text-base leading-tight">{notification.message}</p>
+                            </div>
+                            <button onClick={() => setNotification(null)} className="text-gray-400 hover:text-gray-600">
+                                <Icon name="X" size={18} />
+                            </button>
+                        </div>
+                    )}
 
                     {/* Daily Summary Modal (Replaces Today Summary) */}
                     {summaryDate && (
@@ -1339,7 +1412,7 @@
                             <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden flex flex-col max-h-[80vh]">
                                 <div className="px-5 py-4 border-b bg-gray-50 flex justify-between items-center shrink-0">
                                     <h3 className="font-bold text-gray-800 text-lg flex items-center gap-2"><Icon name="History" size={18} /> 修改歷程</h3>
-                                    <button onClick={() => setIsHistoryOpen(false)} className="text-gray-400 hover:text-gray-600"><Icon name="X" /></button>
+                                    <button onClick={handleCloseHistory} className="text-gray-400 hover:text-gray-600"><Icon name="X" /></button>
                                 </div>
                                 <div className="p-0 overflow-y-auto flex-grow bg-gray-50">
                                     {historyLogs.length === 0 ? <div className="flex flex-col items-center justify-center h-40 text-gray-400 text-sm"><Icon name="Clock" size={32} className="mb-2 opacity-50"/>尚無紀錄</div> : <div className="divide-y divide-gray-100">
@@ -1349,10 +1422,19 @@
                                             if(log.action === 'CREATE' || log.action === 'BATCH_CREATE') { actionColor = 'bg-emerald-100 text-emerald-700'; actionLabel = '新增'; }
                                             if(log.action === 'UPDATE') { actionColor = 'bg-blue-100 text-blue-700'; actionLabel = '修改'; }
                                             if(log.action === 'DELETE') { actionColor = 'bg-rose-100 text-rose-700'; actionLabel = '刪除'; }
+
+                                            // Determine if log is unread
+                                            const isUnread = log.timestamp > lastReadTime;
+
                                             return (
-                                                <div key={log.id} className="p-4 bg-white hover:bg-gray-50 transition-colors">
+                                                <div key={log.id} className={`p-4 transition-colors ${isUnread ? 'bg-orange-50 border-l-4 border-orange-400' : 'bg-white hover:bg-gray-50'}`}>
                                                     <div className="flex justify-between items-start mb-1">
-                                                        <div className="flex items-center gap-2"><span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${actionColor}`}>{actionLabel}</span><span className="text-sm font-bold text-gray-800">{log.details.name}</span><span className="text-xs text-gray-500 bg-gray-100 px-1.5 rounded">{log.details.group}</span></div>
+                                                        <div className="flex items-center gap-2">
+                                                            {isUnread && <span className="bg-red-500 text-white text-[10px] font-bold px-1.5 rounded-full animate-pulse">NEW</span>}
+                                                            <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${actionColor}`}>{actionLabel}</span>
+                                                            <span className="text-sm font-bold text-gray-800">{log.details.name}</span>
+                                                            <span className="text-xs text-gray-500 bg-gray-100 px-1.5 rounded">{log.details.group}</span>
+                                                        </div>
                                                         <div className="flex flex-col items-end">
                                                             <span className="text-[10px] text-gray-400 font-mono">{formatTime(log.timestamp)}</span>
                                                             {log.details.device && (
@@ -1369,7 +1451,7 @@
                                         })}
                                     </div>}
                                 </div>
-                                <div className="p-4 border-t bg-white shrink-0"><button onClick={() => setIsHistoryOpen(false)} className="w-full py-2.5 bg-white border border-gray-300 text-gray-600 rounded-xl font-bold hover:bg-gray-200 transition-colors shadow-sm">關閉</button></div>
+                                <div className="p-4 border-t bg-white shrink-0"><button onClick={handleCloseHistory} className="w-full py-2.5 bg-white border border-gray-300 text-gray-600 rounded-xl font-bold hover:bg-gray-200 transition-colors shadow-sm">關閉 (標示為已讀)</button></div>
                             </div>
                         </div>
                     )}
