@@ -303,7 +303,7 @@
 
             const showNotification = (type, message) => {
                 setNotification({ type, message });
-                setTimeout(() => setNotification(null), 4000); // 延長顯示時間方便閱讀
+                setTimeout(() => setNotification(null), 1000); // 縮短顯示時間為 1 秒
             };
 
             const handleOpenConfig = () => {
