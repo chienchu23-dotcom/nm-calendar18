@@ -9,7 +9,8 @@
     <!-- 1. Core Libraries -->
     <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
-    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- 鎖定 Babel 版本以避免 7.25+ 自動引入 JSX runtime 的問題 -->
+    <script src="https://unpkg.com/@babel/standalone@7.23.9/babel.min.js"></script>
     <script src="https://cdn.tailwindcss.com"></script>
     <!-- Lucide Icons -->
     <script src="https://unpkg.com/lucide@0.263.1/dist/umd/lucide.min.js"></script>
@@ -272,7 +273,9 @@
 
             // Report States
             const [reportYear, setReportYear] = useState(Math.max(2026, new Date().getFullYear()));
-            
+            const [reportMonth, setReportMonth] = useState(new Date().getMonth());
+            const [reportViewType, setReportViewType] = useState('year'); // 'year' or 'month'
+
             const yearOptions = useMemo(() => {
                 const startYear = 2026;
                 const currentYear = new Date().getFullYear();
@@ -293,7 +296,6 @@
                 isHistoryOpenRef.current = isHistoryOpen;
             }, [isHistoryOpen]);
 
-
             const checkIsHoliday = (d) => {
                 const day = d.getDay();
                 if (day === 0 || day === 6) return true;
@@ -303,7 +305,7 @@
 
             const showNotification = (type, message) => {
                 setNotification({ type, message });
-                setTimeout(() => setNotification(null), 1000); // 縮短顯示時間為 1 秒
+                setTimeout(() => setNotification(null), 1000); // 顯示 1 秒
             };
 
             const handleOpenConfig = () => {
@@ -445,10 +447,7 @@
                     // Check for notifications
                     if (isHistoryInit.current) {
                         isHistoryInit.current = false;
-                        // Initialize lastReadTime to the latest log time on first load to prevent flooding "New"
-                        // Or just keep it as initial state (app load time). 
-                        // Let's keep it as app load time.
-                        return; 
+                        return; // Skip initial load
                     }
 
                     snapshot.docChanges().forEach(change => {
@@ -695,7 +694,6 @@
                     });
                     setSelectedDates(new Set());
                     setIsMultiSelectMode(false);
-                    // showNotification('success', '儲存成功'); // Removed duplicate success toast
                 } catch (err) {
                     showNotification('error', '儲存失敗：' + err.message);
                 } finally {
@@ -726,10 +724,6 @@
                         
                         if (curr <= end) {
                             while(curr <= end) {
-                                // Important: We must respect the original skip logic logic implicitly
-                                // But since we are deleting a specific date from an existing record which is already a range,
-                                // we assume all dates in range are valid. 
-                                // Actually, simpler: Just list all dates, exclude target, regoup.
                                 days.push(formatDateForInput(curr));
                                 curr.setDate(curr.getDate() + 1);
                             }
@@ -781,7 +775,6 @@
                                 endDate: firstRange.endDate
                             });
 
-                            // If split into more ranges, create new docs
                             for(let i=1; i<ranges.length; i++) {
                                 await ref.add({
                                     ...baseData,
@@ -793,7 +786,6 @@
                             
                             await addHistoryLog('UPDATE', { ...formData, note: `(Removed ${targetDateStr}) ${formData.note || ''}` });
                         }
-                         showNotification('success', `已取消 ${targetDateStr}`);
                     } else {
                         // Default Delete All
                         try {
@@ -802,7 +794,6 @@
                             console.warn("Log error:", logErr);
                         }
                         await ref.doc(formData.id).delete();
-                        showNotification('success', '刪除成功');
                     }
                     
                     setIsModalOpen(false);
@@ -908,9 +899,14 @@
             const reportStats = useMemo(() => {
                 const stats = {};
                 
-                // Define Report Range (Always Year)
-                let rangeStart = new Date(reportYear, 0, 1);
-                let rangeEnd = new Date(reportYear, 11, 31);
+                let rangeStart, rangeEnd;
+                if (reportViewType === 'year') {
+                    rangeStart = new Date(reportYear, 0, 1);
+                    rangeEnd = new Date(reportYear, 11, 31);
+                } else {
+                    rangeStart = new Date(reportYear, reportMonth, 1);
+                    rangeEnd = new Date(reportYear, reportMonth + 1, 0); 
+                }
 
                 const filteredLeaves = leaves.filter(l => {
                     if (l.type === 'EVENT') return false; 
@@ -963,7 +959,7 @@
                 });
 
                 return Object.values(stats).sort((a, b) => b.total - a.total);
-            }, [leaves, reportYear]);
+            }, [leaves, reportYear, reportMonth, reportViewType]);
 
             const handleDayClick = (date, defaultType = null) => {
                 if(syncStatus !== 'connected') { 
@@ -992,7 +988,7 @@
                     
                     setFormData({ 
                         id: null, name: '', type: type, startDate: str, endDate: str, 
-                        note: '', period: 'FULL', startTime: '', endTime: '', clickedDate: date // Pass date object
+                        note: '', period: 'FULL', startTime: '', endTime: '', clickedDate: date 
                     });
                     setIsModalOpen(true);
                 }
@@ -1016,7 +1012,7 @@
                 setIsModalOpen(true);
             };
 
-            const openEdit = (e, leave, date) => { // Updated to accept date
+            const openEdit = (e, leave, date) => {
                 e.stopPropagation();
                 if (isMultiSelectMode) return;
                 setFormData({ 
@@ -1024,7 +1020,7 @@
                     period: leave.period || 'FULL',
                     startTime: leave.startTime || '',
                     endTime: leave.endTime || '',
-                    clickedDate: date // Capture the clicked date
+                    clickedDate: date 
                 });
                 setIsModalOpen(true);
             };
@@ -1055,7 +1051,6 @@
                 }
             };
 
-            // Summary Modal Logic
             const summaryLeaves = useMemo(() => {
                 if (!summaryDate) return [];
                 return leaves.filter(l => isDateBetween(summaryDate, l.startDate, l.endDate));
@@ -1377,6 +1372,13 @@
                                         </div>
                                         <button onClick={() => setReportYear(y => y + 1)} className="p-1 hover:bg-gray-100 rounded text-gray-500"><Icon name="ChevronRight" size={20}/></button>
                                     </div>
+                                    {reportViewType === 'month' && (
+                                        <div className="flex justify-center items-center gap-4 animate-fadeIn">
+                                            <button onClick={() => setReportMonth(m => (m === 0 ? 11 : m - 1))} className="p-2 bg-white text-indigo-600 rounded-lg shadow-sm border border-indigo-200 hover:bg-indigo-50 active:scale-95 transition-all"><Icon name="ChevronLeft" size={20}/></button>
+                                            <span className="font-bold text-xl text-indigo-900 w-24 text-center">{reportMonth + 1} 月</span>
+                                            <button onClick={() => setReportMonth(m => (m === 11 ? 0 : m + 1))} className="p-2 bg-white text-indigo-600 rounded-lg shadow-sm border border-indigo-200 hover:bg-indigo-50 active:scale-95 transition-all"><Icon name="ChevronRight" size={20}/></button>
+                                        </div>
+                                    )}
                                 </div>
                                 <div className="p-0 overflow-y-auto flex-grow bg-white">
                                     <table className="w-full text-sm text-left">
@@ -1451,7 +1453,7 @@
                                         })}
                                     </div>}
                                 </div>
-                                <div className="p-4 border-t bg-white shrink-0"><button onClick={handleCloseHistory} className="w-full py-2.5 bg-white border border-gray-300 text-gray-600 rounded-xl font-bold hover:bg-gray-200 transition-colors shadow-sm">關閉 (標示為已讀)</button></div>
+                                <div className="p-4 border-t bg-white shrink-0"><button onClick={handleCloseHistory} className="w-full py-2.5 bg-gray-100 text-gray-600 rounded-xl font-bold hover:bg-gray-200 transition-colors shadow-sm">關閉 (標示為已讀)</button></div>
                             </div>
                         </div>
                     )}
